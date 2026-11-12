@@ -17,6 +17,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
@@ -240,6 +241,7 @@ static pthread_mutex_t audio_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t audio_cond = PTHREAD_COND_INITIALIZER;
 
 static audio_command_t audio_command = AUDIO_CMD_NONE;
+static unsigned resume_request_serial; // protected by audio_mutex
 static audio_status_t playback_status = AUDIO_STATUS_STOPPED;
 static char current_filepath[512] = {0};
 static bool play_request = false;
@@ -2528,6 +2530,85 @@ static bool pcm_reroute(snd_pcm_t **pcm, int channels, int rate, int bits, snd_p
 	return *pcm != NULL;
 }
 
+// Caller holds audio_mutex. Re-check after each unlocked driver phase.
+static bool resume_request_cancelled(unsigned serial) {
+	return serial != resume_request_serial || play_request || stop_thread || seek_request ||
+		   hold_flush_request || paused_release_wanted || resume_recover_pending || audio_command != AUDIO_CMD_PLAY;
+}
+
+// Enter and return with audio_mutex held. The playback thread remains the
+// sole owner of the handle while slow driver work runs without the UI lock.
+static bool reopen_paused_pcm(snd_pcm_t **pcm, int channels, int rate, int bits, snd_pcm_uframes_t *period, bool exact_rate) {
+	unsigned serial = resume_request_serial;
+	// A fresh open replaces recovery of the old suspended handle.
+	resume_recover_pending = false;
+	pthread_mutex_unlock(&audio_mutex);
+	if (*pcm) {
+		snd_pcm_close(*pcm);
+		*pcm = NULL;
+		pcm_device_open = false;
+		playback_follow(NULL);
+		// Preserve the driver's close/open settling interval.
+		usleep(150 * 1000);
+	}
+	pthread_mutex_lock(&audio_mutex);
+	if (resume_request_cancelled(serial)) {
+		// Do not touch a receiver's output after Stop during the settling wait.
+		pthread_mutex_unlock(&audio_mutex);
+		pthread_mutex_lock(&audio_mutex);
+		if (hold_flush_request || paused_release_wanted) {
+			hold_flush_request = false;
+			if (audio_command == AUDIO_CMD_PLAY) {
+				audio_command = AUDIO_CMD_PAUSE;
+				playback_status = AUDIO_STATUS_PAUSED;
+			}
+		}
+		return false;
+	}
+	pthread_mutex_unlock(&audio_mutex);
+	int route = alsa_output_key();
+	char device[sizeof(output_pcm)];
+	audio_get_output_device(device, sizeof(device));
+	auto_set_output();
+	(void)exact_rate;
+	*pcm = open_pcm_device(channels, rate, bits, period);
+	char current_device[sizeof(output_pcm)];
+	audio_get_output_device(current_device, sizeof(current_device));
+	bool same_output = route == alsa_output_key() && !strcmp(device, current_device);
+	pthread_mutex_lock(&audio_mutex);
+	if (!same_output || resume_request_cancelled(serial)) {
+		// Do not publish or use a late handle, and never replace the new command
+		// with an old open failure. Close on this same owner without the UI lock.
+		pthread_mutex_unlock(&audio_mutex);
+		if (*pcm) {
+			snd_pcm_close(*pcm);
+			*pcm = NULL;
+			pcm_device_open = false;
+			playback_follow(NULL);
+			// A cancelled open can be retried in this same track loop too.
+			usleep(150 * 1000);
+		}
+		// A quiesce request is acknowledged only after the actual close.
+		// Reuse the pause path so a pending flush cannot cause reopen spinning.
+		pthread_mutex_lock(&audio_mutex);
+		if (hold_flush_request || paused_release_wanted) {
+			hold_flush_request = false;
+			if (audio_command == AUDIO_CMD_PLAY) {
+				audio_command = AUDIO_CMD_PAUSE;
+				playback_status = AUDIO_STATUS_PAUSED;
+			}
+		}
+		return false;
+	}
+	if (!*pcm) {
+		fprintf(stderr, "Audio: cannot reopen the device after a pause\n");
+		audio_command = AUDIO_CMD_PAUSE;
+		playback_status = AUDIO_STATUS_PAUSED;
+		return false;
+	}
+	return true;
+}
+
 // A write failure that survived every in-place recovery still gets one clean
 // retry of the whole track: close everything, pause, and play the same file
 // again from the top, so a failed start costs a half-second hiccup rather than
@@ -2955,42 +3036,9 @@ static void play_wav_file(const char *filepath) {
 				audio_command = AUDIO_CMD_PLAY;
 			}
 			if (is_paused) {
-				// An unpause always reopens the device from scratch, even after
-				// a one-second pause. Reusing the stopped stream (dropped at
-				// the pause, prepared now) leaves this driver in a bad state:
-				// the audio restarts stuttering, and the real-time audio thread
-				// on a single core never yields the CPU, so the interface
-				// stutters with it. The open-then-write path is the one every
-				// track start, prev and next takes. The cost is a few
-				// milliseconds of open, inaudible under a finger that has just
-				// pressed play.
-				if (pcm_handle) {
-					snd_pcm_close(pcm_handle);
-					pcm_handle = NULL;
-					pcm_device_open = false;
-					playback_follow(NULL);
-					// Breathing room after the close: the same as the 120 ms
-					// on a track's way out and the 150 ms in pcm_reroute. On
-					// this driver an open glued to a close comes back busy or
-					// half-broken, and a stream opened that way stutters.
-					usleep(150 * 1000);
-				}
-				// Route before stream, as play_file does at every track start:
-				// during the pause the codec may have gone to rest (amp down,
-				// mute), and opening a PCM over a half-asleep route is the
-				// other way to get stuttering music. No stream is live here, so
-				// poking the codec cannot stall anything.
-				auto_set_output();
 				{
-					// The device was handed back during the pause: take it
-					// again. The file is already positioned where the sound
-					// stopped, so nothing else has to move.
 					snd_pcm_uframes_t new_period = period_size;
-					pcm_handle = open_pcm_device(info.channels, info.sample_rate, info.out_bits, &new_period);
-					if (!pcm_handle) {
-						fprintf(stderr, "Audio: cannot reopen the device after a pause\n");
-						audio_command = AUDIO_CMD_PAUSE;
-						playback_status = AUDIO_STATUS_PAUSED;
+					if (!reopen_paused_pcm(&pcm_handle, info.channels, info.sample_rate, info.out_bits, &new_period, false)) {
 						pthread_mutex_unlock(&audio_mutex);
 						continue;
 					}
@@ -3651,35 +3699,9 @@ static void play_decoded_file(const char *filepath, decode_format_t format) {
 				audio_command = AUDIO_CMD_PLAY;
 			}
 			if (is_paused) {
-				// An unpause always reopens the device from scratch -- see the
-				// twin comment in the WAV loop. Drop-at-pause plus
-				// prepare-at-resume leaves this driver's stream in a bad state:
-				// stuttering audio and a stuttering interface, since the
-				// real-time audio thread never yields the CPU. Open-then-write
-				// is the path every track start takes.
-				if (pcm_handle) {
-					snd_pcm_close(pcm_handle);
-					pcm_handle = NULL;
-					pcm_device_open = false;
-					playback_follow(NULL);
-					// Breathing room after the close -- like the 120 ms on a
-					// track's way out and the 150 ms in pcm_reroute: on this
-					// driver an open glued to a close comes back busy or
-					// half-broken, and the stream stutters.
-					usleep(150 * 1000);
-				}
-				// Route before stream, as play_file does at every start: during
-				// the pause the codec may have gone to rest, and a PCM opened
-				// over a half-asleep route stutters. No stream is live here, so
-				// poking the codec cannot stall anything.
-				auto_set_output();
 				{
 					snd_pcm_uframes_t new_period = period_size;
-					pcm_handle = open_pcm_device(channels, out_rate, out_bits, &new_period);
-					if (!pcm_handle) {
-						fprintf(stderr, "Audio: cannot reopen the device after a pause\n");
-						audio_command = AUDIO_CMD_PAUSE;
-						playback_status = AUDIO_STATUS_PAUSED;
+					if (!reopen_paused_pcm(&pcm_handle, channels, out_rate, out_bits, &new_period, false)) {
 						pthread_mutex_unlock(&audio_mutex);
 						continue;
 					}
@@ -4238,6 +4260,7 @@ int audio_play(const char *filepath) {
 	// The playback thread routes at track start, the stock engine's way.
 
 	pthread_mutex_lock(&audio_mutex);
+	resume_request_serial++;
 	restart_fresh_pending = false; // an explicit play beats the armed restart
 	strncpy(current_filepath, filepath, sizeof(current_filepath) - 1);
 	play_request = true;
@@ -4279,6 +4302,7 @@ int audio_play_at(const char *filepath, double start_secs) {
 	fprintf(stderr, "audio[%ld]: play requested '%s' from %.1f s\n", log_ms(), filepath, start_secs);
 
 	pthread_mutex_lock(&audio_mutex);
+	resume_request_serial++;
 	restart_fresh_pending = false; // an explicit play beats the armed restart
 	strncpy(current_filepath, filepath, sizeof(current_filepath) - 1);
 	current_filepath[sizeof(current_filepath) - 1] = '\0';
@@ -4302,6 +4326,7 @@ int audio_play_paused(const char *filepath, double start_secs) {
 	fprintf(stderr, "audio[%ld]: restore requested '%s' at %.1f s (paused)\n", log_ms(), filepath, start_secs);
 
 	pthread_mutex_lock(&audio_mutex);
+	resume_request_serial++;
 	sleep_fade_reset_locked();
 	restart_fresh_pending = false; // an explicit play beats the armed restart
 	strncpy(current_filepath, filepath, sizeof(current_filepath) - 1);
@@ -4451,6 +4476,7 @@ bool audio_suspend_freeze(int timeout_ms) {
 void audio_pause(void) {
 	printf("pausing\n");
 	pthread_mutex_lock(&audio_mutex);
+	resume_request_serial++;
 	sleep_fade_reset_locked();
 	audio_command = AUDIO_CMD_PAUSE;
 
@@ -4470,6 +4496,7 @@ void audio_resume(void) {
 	// rebuilding everything from scratch at the right point -- fresh decoder,
 	// fresh route, fresh PCM. That is the same path every track start takes.
 	pthread_mutex_lock(&audio_mutex);
+	resume_request_serial++;
 	if (restart_fresh_pending && restart_fresh_path[0]) {
 		char path[512];
 		snprintf(path, sizeof(path), "%s", restart_fresh_path);
@@ -4498,6 +4525,7 @@ void audio_resume(void) {
 void audio_stop(void) {
 	printf("stopping\n");
 	pthread_mutex_lock(&audio_mutex);
+	resume_request_serial++;
 	restart_fresh_pending = false; // explicit stop/card removal cancels cold resume
 	sleep_fade_reset_locked();
 	audio_command = AUDIO_CMD_STOP;
@@ -4615,6 +4643,7 @@ void audio_seek(double seconds) {
 	printf("seeking to %.2f seconds\n", seconds);
 
 	pthread_mutex_lock(&audio_mutex);
+	resume_request_serial++;
 	progress_current_secs = seconds; // the bar follows the finger, not the decoder
 	progress_floor_secs = -1.0;		// and a deliberate jump outranks the pause floor
 	if (restart_fresh_pending) {
