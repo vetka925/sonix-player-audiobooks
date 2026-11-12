@@ -125,6 +125,7 @@ typedef enum {
 	JOB_SET_ALIAS,
 	JOB_SET_CODEC, // text: the codec to switch to
 	JOB_VOLUME,	   // arg_int: percent, for AVRCP absolute volume
+	JOB_RECEIVER_CONNECT,
 	JOB_RX_INFO,   // re-read what a device streaming to this one is sending
 	JOB_RX_CODEC,  // text: the codec to move the incoming stream onto
 	JOB_MEDIA,	   // text: an AVRCP member to send to that device
@@ -1576,6 +1577,7 @@ static void refresh_devices(void) {
 		row.paired = devices[i].paired;
 		row.connected = devices[i].connected;
 		row.trusted = devices[i].trusted;
+		row.audio_source = devices[i].audio_source;
 		row.rssi = devices[i].rssi;
 
 		// bluez hands back the address as the alias when it has nothing better,
@@ -1855,6 +1857,8 @@ static bool user_job_waiting(void) {
 		case JOB_SCAN:
 		case JOB_PAIR:
 		case JOB_CONNECT:
+		case JOB_RECEIVER_CONNECT:
+		case JOB_RECEIVER_PROFILE:
 		case JOB_DISCONNECT:
 		case JOB_FORGET:
 			waiting = true;
@@ -2945,6 +2949,35 @@ static void invite_sources(void) {
 	}
 }
 
+// Unlike the headphone path, this asks for the phone's source profile and
+// never remembers it as a headphone or tears down an existing audio output.
+static bool connect_receiver_device(const char *mac) {
+	if (!receiver_profile_wanted() || !bluealsa_has_sink()) {
+		return false;
+	}
+	char active[BT_ADDR_MAX];
+	if (btstack_audio_sink(active, sizeof(active)) ||
+		(btstack_audio_source(active, sizeof(active)) && strcasecmp(active, mac) != 0)) {
+		return false;
+	}
+	btstack_device_t devices[BT_MAX_DEVICES];
+	int count = btstack_devices(devices, BT_MAX_DEVICES);
+	bool eligible = false;
+	for (int i = 0; i < count; i++) {
+		if (devices[i].paired && devices[i].audio_source && !strcasecmp(devices[i].address, mac)) {
+			eligible = true;
+			break;
+		}
+	}
+	if (!eligible || !receiver_profile_wanted()) {
+		return false;
+	}
+	char error[160] = "";
+	bool ok = btstack_connect(mac, CONNECT_TIMEOUT_MS, error, sizeof(error));
+	fprintf(stderr, "bluetooth: receiver connect -> %s %s\n", ok ? "ok" : "FAILED", error);
+	return ok;
+}
+
 static void *bluetooth_worker(void *arg) {
 	(void)arg;
 	thread_be_background("bluetooth");
@@ -3052,6 +3085,12 @@ static void *bluetooth_worker(void *arg) {
 			case JOB_CONNECT:
 				name_for(job.mac, name, sizeof(name));
 				set_op(connect_device(job.mac) ? BT_OP_OK : BT_OP_FAILED, name);
+				refresh_devices();
+				break;
+
+			case JOB_RECEIVER_CONNECT:
+				name_for(job.mac, name, sizeof(name));
+				set_op(connect_receiver_device(job.mac) ? BT_OP_OK : BT_OP_FAILED, name);
 				refresh_devices();
 				break;
 
@@ -3416,6 +3455,7 @@ static void post_device_job(job_type_t type, const char *mac) {
 
 void bluetooth_pair(const char *mac) { post_device_job(JOB_PAIR, mac); }
 void bluetooth_connect(const char *mac) { post_device_job(JOB_CONNECT, mac); }
+void bluetooth_connect_receiver(const char *mac) { post_device_job(JOB_RECEIVER_CONNECT, mac); }
 void bluetooth_disconnect(const char *mac) { post_device_job(JOB_DISCONNECT, mac); }
 void bluetooth_forget(const char *mac) { post_device_job(JOB_FORGET, mac); }
 

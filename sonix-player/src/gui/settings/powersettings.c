@@ -113,7 +113,9 @@ void powersettings_apply(void) {
 		power_set_charge_limit(CHARGE_LIMIT_MIN + (charge_index() * CHARGE_LIMIT_STEP));
 	}
 
-	power_set_auto_off(config_get_bool("power", "auto_off", false), (uint32_t)AUTO_OFF[auto_off_index()].minutes);
+	// An untouched player should not stay in standby until its battery runs out.
+	// An explicit user choice to disable auto-off still takes precedence.
+	power_set_auto_off(config_get_bool("power", "auto_off", true), (uint32_t)AUTO_OFF[auto_off_index()].minutes);
 
 	// Suspend-to-RAM standby, on by default: saves battery by suspending the
 	// player shortly after the screen goes off.
@@ -179,7 +181,7 @@ static void refresh_labels(void) {
 	}
 
 	// One card: the slider is only on it while the toggle is on.
-	bool auto_off = config_get_bool("power", "auto_off", false);
+	bool auto_off = config_get_bool("power", "auto_off", true);
 	if (auto_off) {
 		lv_obj_add_state(auto_off_switch, LV_STATE_CHECKED);
 	} else {

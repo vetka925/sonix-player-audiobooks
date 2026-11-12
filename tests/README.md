@@ -47,3 +47,25 @@ The small ALSA include stub is only for host tests: `audio.h` exposes no ALSA ty
 
 These checks are not a complete firmware/driver test suite. They do not verify
 MIPS ABI, audio output, physical removal, recovery, or flash the device.
+
+## Receiver regression and GUI checks
+
+`sh tests/run-receiver-test.sh` exercises the production worker operation and
+the page's retry callback: source eligibility, occupied output, closed receiver,
+missing profile, D-Bus failure, capture retry and duplicate taps. The runner
+extracts complete production functions, following the navigation harness above.
+
+On Linux, `sh tests/build-receiver-ui.sh` builds `/tmp/sonix-receiver-ui` with
+the real UI and a link-time Bluetooth test boundary. Use a temporary
+`SONIX_CONFIG` and `SONIX_SD_ROOT`; set `[clock] configured = 1`,
+`[ui] language = Russian`, and `[power] screen_off_seconds = 0` in the config.
+Set `SONIX_LANG_DIR` to this checkout's R1 language directory and run from
+`sonix-player/` so fallback fonts resolve. Set `SONIX_PANEL=480x800` for R1
+or `480x720` for the smaller panel. No real Bluetooth service is used.
+
+Open Wireless > Bluetooth, enable it, then open Receiver. Only the fixture
+phone should appear, not the fixture headphones. The first tap fails after
+1.8 seconds, the second establishes an aptX stream. The page must remain open,
+show progress/error/success, and prevent duplicate taps while pending.
+`SONIX_TEST_NO_SOURCES=1` exercises first-pairing instructions with no list.
+These tests do not prove RF interoperability or sound on a physical device.

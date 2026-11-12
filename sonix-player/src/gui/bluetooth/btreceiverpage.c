@@ -3,10 +3,10 @@
 #include <stdio.h>
 #include <string.h>
 
-#include "src/gui/shell/confirm.h"
 #include "src/gui/fonts/fonts.h"
-#include "src/gui/shell/icons.h"
+#include "src/gui/shell/confirm.h"
 #include "src/gui/shell/gui.h"
+#include "src/gui/shell/icons.h"
 #include "src/gui/shell/pagetimer.h"
 #include "src/gui/shell/popover.h"
 #include "src/gui/shell/settingsrow.h"
@@ -29,6 +29,60 @@ static lv_obj_t *title_label;
 static lv_timer_t *poll_timer;
 static unsigned last_serial = (unsigned)-1;
 static lv_color_t status_normal_color;
+static lv_obj_t *sources_list;
+static bt_device_t sources[BT_MAX_DEVICES];
+static int source_count;
+static bool connecting;
+static bool connect_failed;
+static uint32_t sources_serial;
+// A failed capture is retried only after a new peer or an explicit user retry.
+static char started_for[24];
+
+static void source_clicked(lv_event_t *event) {
+	if (connecting || switcher_back_drag_active())
+		return;
+	const char *mac = lv_event_get_user_data(event);
+	connecting = true;
+	connect_failed = false;
+	started_for[0] = '\0';
+	bluetooth_take_op_result(NULL, 0);
+	bluetooth_connect_receiver(mac);
+}
+
+static void refresh_sources(void) {
+	uint32_t serial = bluetooth_devices_serial();
+	if (serial != sources_serial) {
+		sources_serial = serial;
+		lv_obj_clean(sources_list);
+		bt_device_t paired[BT_MAX_DEVICES];
+		int count = bluetooth_get_paired(paired, BT_MAX_DEVICES);
+		source_count = 0;
+		for (int i = 0; i < count; i++) {
+			if (!paired[i].audio_source)
+				continue;
+			sources[source_count] = paired[i];
+			lv_obj_t *button = lv_button_create(sources_list);
+			lv_obj_set_size(button, lv_pct(100), 58);
+			lv_obj_add_style(button, &theme_style_card, 0);
+			lv_obj_add_event_cb(button, source_clicked, LV_EVENT_CLICKED, sources[source_count].mac);
+			lv_obj_t *label = lv_label_create(button);
+			lv_obj_set_width(label, lv_pct(100));
+			lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
+			lv_label_set_text(label, sources[source_count].name);
+			lv_obj_add_style(label, &theme_style_text, 0);
+			lv_obj_set_style_text_font(label, &font_ui_22, 0);
+			lv_obj_center(label);
+			source_count++;
+		}
+	}
+	for (uint32_t i = 0; i < lv_obj_get_child_count(sources_list); i++) {
+		lv_obj_t *button = lv_obj_get_child(sources_list, i);
+		if (connecting || bluetooth_busy())
+			lv_obj_add_state(button, LV_STATE_DISABLED);
+		else
+			lv_obj_remove_state(button, LV_STATE_DISABLED);
+	}
+}
 
 // ---------------------------------------------------------------------------
 
@@ -47,6 +101,8 @@ static void format_rate(unsigned rate, char *out, size_t size) {
 static void refresh(void) {
 	btreceiver_state_t st;
 	btreceiver_get_state(&st);
+	refresh_sources();
+	lv_obj_set_hidden(sources_list, st.active || source_count == 0);
 
 	lv_obj_set_style_text_color(status_label, status_normal_color, 0);
 
@@ -68,8 +124,7 @@ static void refresh(void) {
 		bool source = bluetooth_receiver_device(NULL, 0, name, sizeof(name));
 		lv_label_set_text(device_label, source ? name : "");
 		lv_label_set_text(format_label, "");
-		lv_label_set_text(status_label,
-						  source ? tr("btreceiver_connecting") : tr("btreceiver_no_source_note"));
+		lv_label_set_text(status_label, connect_failed ? tr("btreceiver_connect_failed") : (source || connecting) ? tr("btreceiver_connecting") : tr(source_count ? "btreceiver_choose_source" : "btreceiver_no_source_note"));
 		return;
 	}
 
@@ -114,10 +169,9 @@ static void refresh(void) {
 static bool leaving;
 
 // The device the mode was last started for from here. A start that ended in
-// an error is not tried again for the same device until it has gone away:
+// an error is retried for the same device only after it goes away or the user
+// explicitly selects it again:
 // otherwise the page would restart a failing stream every half second.
-static char started_for[24];
-
 // Starts the mode when a sender is connected and the mode is not running --
 // on arrival, and for a phone or a computer that connects while the page is
 // open, which is when a sender usually turns up.
@@ -145,6 +199,14 @@ static void poll_cb(lv_timer_t *timer) {
 		return;
 	}
 	start_if_sender();
+	if (connecting) {
+		bt_op_t result = bluetooth_take_op_result(NULL, 0);
+		if (result == BT_OP_OK || result == BT_OP_FAILED) {
+			connecting = false;
+			connect_failed = result == BT_OP_FAILED;
+			last_serial = (unsigned)-1;
+		}
+	}
 	// The codec can be renegotiated mid-stream and the Bluetooth serial moves
 	// when it is, so both serials count. The stream falling silent counts too
 	// and has no serial of its own: nothing runs when frames stop arriving, so
@@ -154,9 +216,8 @@ static void poll_cb(lv_timer_t *timer) {
 	// The metadata has its own counter, bumped by the sender's announcement
 	// rather than by anything here, and it is carried in the receiver's stream
 	// serial: without it a track change on the phone would not redraw the page.
-	unsigned now = btreceiver_serial() + bluetooth_devices_serial() + bluetooth_receiver_stream_serial() +
-				   (st.streaming ? 1u : 0u);
-	if (now == last_serial) {
+	unsigned now = btreceiver_serial() + bluetooth_devices_serial() + bluetooth_receiver_stream_serial() + (st.streaming ? 1u : 0u);
+	if (now == last_serial && !connecting) {
 		return;
 	}
 	last_serial = now;
@@ -254,6 +315,10 @@ static void loaded_cb(lv_event_t *e) {
 	// The A2DP sink exists only while this page is open (bluetooth.h): a phone
 	// connects to it from here on.
 	bluetooth_set_receiver_profile(true);
+	bluetooth_set_discoverable(true);
+	connecting = false;
+	connect_failed = false;
+	sources_serial = (uint32_t)-1;
 	last_serial = (unsigned)-1;
 	// Arriving is the switch: there is nothing else this page does, so a toggle
 	// on it would only repeat what opening it already said.
@@ -270,6 +335,7 @@ static void unloaded_cb(lv_event_t *e) {
 	// holding a stream nobody can see.
 	btreceiver_stop();
 	bluetooth_set_receiver_profile(false);
+	bluetooth_set_discoverable(false);
 }
 
 void btreceiverpage_init(gui_config_t *cfg) {
@@ -338,6 +404,14 @@ void btreceiverpage_init(gui_config_t *cfg) {
 	lv_obj_set_style_margin_top(status_label, 10, 0);
 	lv_label_set_text(status_label, "");
 	status_normal_color = lv_obj_get_style_text_color(status_label, LV_PART_MAIN);
+
+	sources_list = lv_obj_create(container);
+	lv_obj_set_size(sources_list, lv_pct(100), 180);
+	lv_obj_set_flex_flow(sources_list, LV_FLEX_FLOW_COLUMN);
+	lv_obj_set_style_bg_opa(sources_list, LV_OPA_TRANSP, 0);
+	lv_obj_set_style_border_width(sources_list, 0, 0);
+	lv_obj_set_style_pad_all(sources_list, 4, 0);
+	lv_obj_set_style_pad_row(sources_list, 8, 0);
 
 	lv_obj_add_event_cb(btreceiverpage_screen, loaded_cb, LV_EVENT_SCREEN_LOADED, NULL);
 	lv_obj_add_event_cb(btreceiverpage_screen, unloaded_cb, LV_EVENT_SCREEN_UNLOADED, NULL);

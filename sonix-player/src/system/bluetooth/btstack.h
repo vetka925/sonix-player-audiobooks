@@ -47,6 +47,7 @@ typedef struct {
 	bool trusted;
 	bool connected; // the ACL link, not the audio profile
 	bool audio_sink; // advertises the A2DP sink UUID: headphones, not a phone
+	bool audio_source; // advertises A2DP source: a phone or computer
 	unsigned cod;	 // class of device, 0 when bluez has none (every LE-only device)
 	int rssi;		 // 0 when bluez does not have one
 } btstack_device_t;

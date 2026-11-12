@@ -430,6 +430,9 @@ static void read_device_props(dbus_reader_t *r, btstack_device_t *dev) {
 					if (strcasecmp(uuid, UUID_A2DP_SINK) == 0) {
 						dev->audio_sink = true;
 					}
+					if (strcasecmp(uuid, UUID_A2DP_SOURCE) == 0) {
+						dev->audio_source = true;
+					}
 				}
 			}
 		} else if (!dbus_r_skip(r, sig)) {

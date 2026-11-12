@@ -42,6 +42,7 @@ typedef struct {
 	bool paired;
 	bool connected;
 	bool trusted;
+	bool audio_source;
 	int rssi; // scan results only, 0 when unknown
 } bt_device_t;
 
@@ -109,6 +110,8 @@ void bluetooth_refresh(void);
 
 void bluetooth_pair(const char *mac);
 void bluetooth_connect(const char *mac);
+// Connect a paired sender while Receiver is open. Does not change the last headphones.
+void bluetooth_connect_receiver(const char *mac);
 void bluetooth_disconnect(const char *mac);
 void bluetooth_forget(const char *mac);
 // The name a paired device is shown under on this player. An empty name gives
