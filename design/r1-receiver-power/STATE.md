@@ -5,7 +5,8 @@
 - Scope approved by the owner's direct request to fix receiver reconnection and
   investigate standby drain. No repeated start gate; timeout not applicable.
 - Execution: one Codex writer; exact model unknown (not exposed in this session).
-- One bounded read-only reviewer completed with no actionable findings.
+- The selected fork package received one bounded independent review. Its delayed
+  adapter initialization finding was fixed with a failing-then-passing regression.
 - Branch: `codex/r1-receiver-power-20261112`, based on audiobook fork `aa2873f`.
 - Evidence: [report](../../docs/receiver-power-20261112.md).
 - Firmware is packaged locally; installation/publication has not been performed.
@@ -13,3 +14,7 @@
   uninterrupted suspend and zero failures. Historical drain did not reproduce.
 - Next: acceptance of the concrete build before installation, followed by
   real phone-to-R1 audio and reconnect validation.
+
+- Selected fork changes are implemented: idle workers, mono routing and position
+  retention, bounded receiver recovery, responsive resume and touch frames,
+  service-owner recovery, child descriptor ownership. YouTube Music is deferred.

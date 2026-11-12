@@ -21,47 +21,47 @@
 ### Task 1: Idle workers
 Files: system/remote/sonixlink.c, system/bluetooth/btvolume.c, tests/idle_workers_test.py.
 Interfaces: existing enable setters/condition variables; no public API change.
-- [ ] Exercise extracted real worker wait logic: disabled SonixLink uses signalled wait, empty Bluetooth stream waits 60000ms, a real stream retains 600ms polling; observe baseline failure.
-- [ ] Adapt 16fe631 and 42f0f00; verify wake requests remain under the existing lock and rerun tests.
-- [ ] Commit.
+- [x] Exercise extracted real worker wait logic: disabled SonixLink uses signalled wait, empty Bluetooth stream waits 60000ms, a real stream retains 600ms polling; observe baseline failure.
+- [x] Adapt 16fe631 and 42f0f00; verify wake requests remain under the existing lock and rerun tests.
+- [x] Commit.
 
 ### Task 2: Mono and position preservation
 Files: system/audio/audio.c, gui/bluetooth/btaudio.c, tests/audio_recovery_test.py and fixtures.
 Interfaces: audio_play_at/audio_play_paused; retain failed initial open state for audio_resume.
-- [ ] Add failing production-function tests for mono 44.1/48k, stereo, paused codec reload, newer seek/stop ownership and failed open position.
-- [ ] Apply upstream PR188 and adapt application hunks of 9ed30d5/4f330f6, never daemon hunks.
-- [ ] Run regression fixtures, then commit.
+- [x] Add failing production-function tests for mono 44.1/48k, stereo, paused codec reload, newer seek/stop ownership and failed open position.
+- [x] Apply upstream PR188 and adapt application hunks of 9ed30d5/4f330f6, never daemon hunks.
+- [x] Run regression fixtures, then commit.
 
 ### Task 3: Bounded external PCM recovery
 Files: system/audio/audio.c, tests/audio_external_recovery_test.*.
 Interfaces: audio_external_begin/write/end unchanged.
-- [ ] Exercise repeated EAGAIN/EPIPE/ESTRPIPE, cancellation, failed prepare and successful recovery against production functions; observe failures.
-- [ ] Adapt external-audio part of a255b04: monotonic 2-second no-progress deadline, at most one reopen, cancellation visible before lock, bounded waits.
-- [ ] Verify progress resets deadline and end releases output, then commit.
+- [x] Exercise repeated EAGAIN/EPIPE/ESTRPIPE, cancellation, failed prepare and successful recovery against production functions; observe failures.
+- [x] Adapt external-audio part of a255b04: monotonic 2-second no-progress deadline, at most one reopen, cancellation visible before lock, bounded waits.
+- [x] Verify progress resets deadline and end releases output, then commit.
 
 ### Task 4: Resume responsiveness and touch frames
 Files: system/audio/audio.c, Makefile, tools/lvgl_evdev_frames.py, tests/audio_resume_open_test.*, tests/evdev_*.
 Interfaces: existing audio commands; serial guards protect unlocked driver work.
-- [ ] Import/adapt production-code fixtures for queued press/release and Stop/seek/route change during slow resume; observe red.
-- [ ] Adapt aa4140b + 9167fe9 + f30fa3d as a unit; make driver patch idempotent and preserve current touch fixes.
-- [ ] Run tests on Linux matching LVGL, then commit.
+- [x] Import/adapt production-code fixtures for queued press/release and Stop/seek/route change during slow resume; observe red.
+- [x] Adapt aa4140b + 9167fe9 + f30fa3d as a unit; make driver patch idempotent and preserve current touch fixes.
+- [x] Run tests on Linux matching LVGL, then commit.
 
 ### Task 5: Bluetooth service ownership
 Files: system/bluetooth/btstack.[ch], bluetooth.c, tests/btstack_owner* and rebind tests.
 Interfaces: generation/service-loss notification from btstack; priority recovery flag in worker.
-- [ ] Adapt fork lifecycle/real-private-D-Bus tests, demonstrate missing owner-change recovery.
-- [ ] Adapt c6aafe7 + ef91871 together; clear service-owned caches and reject retired replies, retain receiver connect/profile jobs.
-- [ ] Verify queue saturation, BlueALSA versus BlueZ loss, receiver and headphone state; commit.
+- [x] Adapt fork lifecycle/real-private-D-Bus tests, demonstrate missing owner-change recovery.
+- [x] Adapt c6aafe7 + ef91871 together; clear service-owned caches and reject retired replies, retain receiver connect/profile jobs.
+- [x] Verify queue saturation, BlueALSA versus BlueZ loss, receiver and headphone state; commit.
 
 ### Task 6: Child descriptor ownership
 Files: system/core/logging.c, tests/child_exec_fds_test.c.
 Interfaces: logging_child_stdio stays same; parent caches FD bound.
-- [ ] Exercise fork/exec inheritance with an open file and output pipes; baseline must retain unintended FD.
-- [ ] Adapt logging-only parts of 7ff50f1 and 5b6f554, preserve intentional stdio; test and commit.
+- [x] Exercise fork/exec inheritance with an open file and output pipes; baseline must retain unintended FD.
+- [x] Adapt logging-only parts of 7ff50f1 and 5b6f554, preserve intentional stdio; test and commit.
 
 ### Task 7: Integration and firmware
-- [ ] Run full Linux audiobook suite plus new regressions; host and MIPS builds, ABI verification, source diff check.
-- [ ] Exercise receiver UI regression with actual LVGL simulator; no invented radio success.
-- [ ] One bounded final review, fix concrete findings with regression evidence.
-- [ ] Package R1 firmware, preserve rollback, compare SHA-256 after download.
-- [ ] Update existing report/STATE with results and remaining hardware acceptance; commit named paths. Installation/publication remains subject to concrete result acceptance.
+- [x] Run full Linux audiobook suite plus new regressions; host and MIPS builds, ABI verification, source diff check.
+- [x] Exercise receiver UI regression with actual LVGL simulator; no invented radio success.
+- [x] One bounded final review, fix concrete findings with regression evidence.
+- [x] Package R1 firmware, preserve rollback, compare SHA-256 after download.
+- [x] Update existing report/STATE with results and remaining hardware acceptance; commit named paths. Installation/publication remains subject to concrete result acceptance.
