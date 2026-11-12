@@ -77,6 +77,9 @@ bool btstack_register_agent(void);
 // True while the socket is live. Goes false when dbus-daemon exits, which is
 // the signal to open again.
 bool btstack_alive(void);
+// Cached owner-loss state; recovery runs only on the Bluetooth worker.
+bool btstack_rebind_needed(void);
+bool btstack_bluez_rebind_needed(void);
 
 // Called on the D-Bus reader thread whenever bluez or bluealsa announced a
 // change. Record and return: it must not block and must not call back in here.
