@@ -1310,14 +1310,20 @@ static void log_pcm_chain(snd_pcm_t *pcm) {
 // ---------------------------------------------------------------------------
 
 // Opens `device` (a bluealsa name) behind a plug whose slave runs at `rate`,
-// under BT_CONVERTED_PCM. The plug is added to a copy of the global
+// under BT_CONVERTED_PCM. `channels`, when not 0, fixes the slave's channels
+// too: a mono track is sent as two, the one channel in both, because A2DP
+// headphones play a one-channel stream as silence (AirPods, at least), or in
+// one ear. The plug is added to a copy of the global
 // configuration, where bluealsa's own definitions are, and the copy is dropped
 // once the PCM is open -- which is what snd_pcm_open() does with the
 // configuration it opens from, too.
-static int open_bluetooth_at_rate(snd_pcm_t **pcm, const char *device, unsigned rate, int mode) {
-	char text[sizeof(output_pcm) + 128];
-	int len = snprintf(text, sizeof(text), "pcm." BT_CONVERTED_PCM " { type plug slave { pcm \"%s\" rate %u } }",
-					   device, rate);
+static int open_bluetooth_at_rate(snd_pcm_t **pcm, const char *device, unsigned rate, unsigned channels, int mode) {
+	char text[sizeof(output_pcm) + 160];
+	char fixed_channels[24] = "";
+	if (channels) {
+		snprintf(fixed_channels, sizeof(fixed_channels), " channels %u", channels);
+	}
+	int len = snprintf(text, sizeof(text), "pcm." BT_CONVERTED_PCM " { type plug slave { pcm \"%s\" rate %u%s } }", device, rate, fixed_channels);
 	if (len < 0 || (size_t)len >= sizeof(text)) {
 		return -EINVAL;
 	}
@@ -1455,12 +1461,22 @@ static snd_pcm_t *open_pcm_device_now(int channels, int sample_rate, int bits_pe
 		}
 	}
 
+	// A mono track goes through the same plug, at its own rate if nothing else
+	// needs converting, so it reaches the headphones as two channels.
+	unsigned upmix_to = 0;
+	if (bluetooth && channels == 1) {
+		upmix_to = 2;
+		if (!convert_to) {
+			convert_to = (unsigned)sample_rate;
+		}
+		fprintf(stderr, "audio: the mono track is sent to both ears\n");
+	}
+
 	int err = -EBUSY;
 	int attempts = 0;
 	int budget = (bluetooth && bluetooth_audio_active()) ? 160 : 40; // eight seconds, or two
 	for (; attempts < budget; attempts++) {
-		err = convert_to ? open_bluetooth_at_rate(&pcm_handle, device, convert_to, mode)
-						 : snd_pcm_open(&pcm_handle, device, SND_PCM_STREAM_PLAYBACK, mode);
+		err = convert_to ? open_bluetooth_at_rate(&pcm_handle, device, convert_to, upmix_to, mode) : snd_pcm_open(&pcm_handle, device, SND_PCM_STREAM_PLAYBACK, mode);
 		if (err >= 0) {
 			break;
 		}
@@ -2535,6 +2551,40 @@ static bool retry_track_once(const char *filepath, const char *reason) {
 	return true;
 }
 
+// A failed output is not a failed source. Keep the decoder and its position;
+// the normal pause path rewinds unwritten input and reopens only the PCM on
+// resume. Never replace a newer play, stop or seek with this old write error.
+static void pause_failed_output(void) {
+	pthread_mutex_lock(&audio_mutex);
+	if (!play_request && !stop_thread && !seek_request && audio_command != AUDIO_CMD_STOP) {
+		audio_command = AUDIO_CMD_PAUSE;
+		playback_status = AUDIO_STATUS_PAUSED;
+	}
+	pthread_mutex_unlock(&audio_mutex);
+}
+
+// A route reload may fail before reaching the normal pause loop. Its decoder
+// is already closed, so reuse the cold-resume state instead of restarting at
+// zero on the next Play. Newer commands keep ownership of their request.
+static void retain_failed_output(const char *filepath) {
+	pcm_device_open = false;
+	pthread_mutex_lock(&audio_mutex);
+	if (!play_request && !stop_thread && audio_command != AUDIO_CMD_STOP &&
+		strcmp(current_filepath, filepath) == 0) {
+		double position = seek_request ? seek_target_secs : progress_current_secs;
+		restart_fresh_pending = true;
+		snprintf(restart_fresh_path, sizeof(restart_fresh_path), "%s", filepath);
+		restart_fresh_pos = position > 0 ? position : 0;
+		progress_current_secs = restart_fresh_pos;
+		seek_request = false;
+		seek_target_secs = -1.0;
+		audio_command = AUDIO_CMD_STOP;
+		playback_status = AUDIO_STATUS_PAUSED;
+		track_completed = false;
+	}
+	pthread_mutex_unlock(&audio_mutex);
+}
+
 // ---------------------------------------------------------------------------
 // Rebuffering
 //
@@ -2741,10 +2791,7 @@ static void play_wav_file(const char *filepath) {
 	}
 	if (!pcm_handle) {
 		fclose(f);
-		pthread_mutex_lock(&audio_mutex);
-		audio_command = AUDIO_CMD_STOP;
-		playback_status = AUDIO_STATUS_STOPPED;
-		pthread_mutex_unlock(&audio_mutex);
+		retain_failed_output(filepath);
 		return;
 	}
 	track_started();
@@ -2787,6 +2834,7 @@ static void play_wav_file(const char *filepath) {
 	int64_t bytes_played = 0;
 	int64_t read_pos = 0; // bytes of the data chunk already read, ahead of bytes_played by what is queued
 	bool is_paused = false;
+	bool input_needs_rewind = false;
 	bool played_to_the_end = false;
 	int route_check = 0;
 	int track_route = alsa_output_key(); // the output auto_set_output just applied
@@ -2812,6 +2860,7 @@ static void play_wav_file(const char *filepath) {
 
 			fseeko(f, (off_t)(info.data_offset + target_byte_pos), SEEK_SET);
 			read_pos = target_byte_pos;
+			input_needs_rewind = false;
 
 			// The device may have been handed back during a long pause (see the
 			// PAUSE branch below), and then there is no stream to flush. It has
@@ -2845,7 +2894,7 @@ static void play_wav_file(const char *filepath) {
 
 			if (entering) {
 				int64_t rewind_bytes = pause_stop_stream(pcm_handle, src_frame_bytes);
-				if (rewind_bytes > 0) {
+				if (rewind_bytes > 0 || input_needs_rewind) {
 					// What was still in the buffer was never heard: wind the
 					// file back over it so resuming picks up where the sound
 					// actually stopped.
@@ -2855,6 +2904,7 @@ static void play_wav_file(const char *filepath) {
 					}
 					fseeko(f, (off_t)(info.data_offset + bytes_played), SEEK_SET);
 					read_pos = bytes_played;
+					input_needs_rewind = false;
 					pthread_mutex_lock(&audio_mutex);
 					progress_floor_secs = progress_current_secs; // the bar stays put
 					progress_current_secs = (double)bytes_played / bytes_per_sec;
@@ -2939,10 +2989,10 @@ static void play_wav_file(const char *filepath) {
 					pcm_handle = open_pcm_device(info.channels, info.sample_rate, info.out_bits, &new_period);
 					if (!pcm_handle) {
 						fprintf(stderr, "Audio: cannot reopen the device after a pause\n");
-						audio_command = AUDIO_CMD_STOP;
-						playback_status = AUDIO_STATUS_STOPPED;
+						audio_command = AUDIO_CMD_PAUSE;
+						playback_status = AUDIO_STATUS_PAUSED;
 						pthread_mutex_unlock(&audio_mutex);
-						break;
+						continue;
 					}
 					if (new_period > period_size) {
 						char *bigger = realloc(buffer, new_period * frame_bytes);
@@ -2982,6 +3032,13 @@ static void play_wav_file(const char *filepath) {
 			}
 		}
 		pthread_mutex_unlock(&audio_mutex);
+
+		// A failed write consumed input but produced no confirmed output.
+		if (input_needs_rewind) {
+			fseeko(f, (off_t)(info.data_offset + bytes_played), SEEK_SET);
+			read_pos = bytes_played;
+			input_needs_rewind = false;
+		}
 
 		// Every ~32 buffers: has the jack changed?
 		if (++route_check >= 32) {
@@ -3113,14 +3170,9 @@ static void play_wav_file(const char *filepath) {
 		}
 		if (written < 0 || !pcm_handle) {
 			fprintf(stderr, "Audio: Write failed beyond recovery: %s\n", snd_strerror((int)written));
-			if (retry_track_once(filepath, "write failure")) {
-				break; // the thread loop picks the queued replay up
-			}
-			pthread_mutex_lock(&audio_mutex);
-			audio_command = AUDIO_CMD_STOP;
-			playback_status = AUDIO_STATUS_STOPPED;
-			pthread_mutex_unlock(&audio_mutex);
-			break;
+			input_needs_rewind = true;
+			pause_failed_output();
+			continue;
 		}
 
 		bt_seek_probe_report(pcm_handle);
@@ -3373,10 +3425,7 @@ static void play_decoded_file(const char *filepath, decode_format_t format) {
 	if (!pcm_handle) {
 		set_dac_dop(0);
 		decoder_close(dec);
-		pthread_mutex_lock(&audio_mutex);
-		audio_command = AUDIO_CMD_STOP;
-		playback_status = AUDIO_STATUS_STOPPED;
-		pthread_mutex_unlock(&audio_mutex);
+		retain_failed_output(filepath);
 		return;
 	}
 	track_started();
@@ -3411,6 +3460,7 @@ static void play_decoded_file(const char *filepath, decode_format_t format) {
 	// own mid-book.
 	int64_t bytes_played = 0;
 	bool is_paused = false;
+	bool input_needs_rewind = false;
 	bool played_to_the_end = false;
 	int route_check = 0;
 	int track_route = alsa_output_key(); // the output auto_set_output just applied
@@ -3527,6 +3577,7 @@ static void play_decoded_file(const char *filepath, decode_format_t format) {
 			}
 
 			bytes_played = (int64_t)(target_frame * frame_bytes);
+			input_needs_rewind = false;
 			pthread_mutex_lock(&audio_mutex);
 			progress_current_secs = (double)bytes_played / bytes_per_sec;
 			pthread_mutex_unlock(&audio_mutex);
@@ -3542,7 +3593,7 @@ static void play_decoded_file(const char *filepath, decode_format_t format) {
 
 			if (entering) {
 				int64_t rewind_bytes = pause_stop_stream(pcm_handle, frame_bytes) * decim_factor;
-				if (rewind_bytes > 0) {
+				if (rewind_bytes > 0 || input_needs_rewind) {
 					// The frames still queued were never heard: put the decoder
 					// back over them so resuming carries on from where the
 					// sound actually stopped instead of skipping a beat.
@@ -3550,10 +3601,12 @@ static void play_decoded_file(const char *filepath, decode_format_t format) {
 					uint64_t rewind_frames = (uint64_t)(rewind_bytes / frame_bytes);
 					uint64_t resume_frame = played_frames > rewind_frames ? played_frames - rewind_frames : 0;
 					if (decoder_seek_to_frame(dec, resume_frame)) {
+						speed_reset(stretch);
 						if (decim_factor > 1) {
 							decimate_reset(&decim);
 						}
 						bytes_played = (int64_t)(resume_frame * frame_bytes);
+						input_needs_rewind = false;
 						pthread_mutex_lock(&audio_mutex);
 						progress_floor_secs = progress_current_secs; // the bar stays put
 						progress_current_secs = (double)bytes_played / bytes_per_sec;
@@ -3625,10 +3678,10 @@ static void play_decoded_file(const char *filepath, decode_format_t format) {
 					pcm_handle = open_pcm_device(channels, out_rate, out_bits, &new_period);
 					if (!pcm_handle) {
 						fprintf(stderr, "Audio: cannot reopen the device after a pause\n");
-						audio_command = AUDIO_CMD_STOP;
-						playback_status = AUDIO_STATUS_STOPPED;
+						audio_command = AUDIO_CMD_PAUSE;
+						playback_status = AUDIO_STATUS_PAUSED;
 						pthread_mutex_unlock(&audio_mutex);
-						break;
+						continue;
 					}
 					snd_pcm_uframes_t new_chunk = decimated_chunk(new_period, out_rate, decim_factor);
 					if (new_chunk > chunk_frames) {
@@ -3659,6 +3712,16 @@ static void play_decoded_file(const char *filepath, decode_format_t format) {
 			}
 		}
 		pthread_mutex_unlock(&audio_mutex);
+
+		if (input_needs_rewind) {
+			if (decoder_seek_to_frame(dec, (uint64_t)(bytes_played / frame_bytes))) {
+				speed_reset(stretch);
+				if (decim_factor > 1) decimate_reset(&decim);
+			} else {
+				fprintf(stderr, "Audio: live input cannot rewind after output failure\n");
+			}
+			input_needs_rewind = false;
+		}
 
 		// Every ~32 buffers: has the jack changed?
 		if (++route_check >= 32) {
@@ -3897,14 +3960,9 @@ static void play_decoded_file(const char *filepath, decode_format_t format) {
 		}
 		if (written < 0 || !pcm_handle) {
 			fprintf(stderr, "Audio: Write failed beyond recovery: %s\n", snd_strerror((int)written));
-			if (retry_track_once(filepath, "write failure")) {
-				break; // the thread loop picks the queued replay up
-			}
-			pthread_mutex_lock(&audio_mutex);
-			audio_command = AUDIO_CMD_STOP;
-			playback_status = AUDIO_STATUS_STOPPED;
-			pthread_mutex_unlock(&audio_mutex);
-			break;
+			input_needs_rewind = true;
+			pause_failed_output();
+			continue;
 		}
 
 		bt_seek_probe_report(pcm_handle);
@@ -4229,10 +4287,8 @@ int audio_play_at(const char *filepath, double start_secs) {
 	write_fail_retry_used = false;
 	audio_command = AUDIO_CMD_PLAY;
 	playback_status = AUDIO_STATUS_PLAYING;
-	if (start_secs > 0) {
-		seek_request = true;
-		seek_target_secs = start_secs;
-	}
+	seek_request = start_secs > 0;
+	seek_target_secs = seek_request ? start_secs : -1.0;
 	progress_current_secs = start_secs > 0 ? start_secs : 0;
 	progress_floor_secs = -1.0;
 	progress_total_secs = 0;
@@ -4255,10 +4311,8 @@ int audio_play_paused(const char *filepath, double start_secs) {
 	write_fail_retry_used = false;
 	audio_command = AUDIO_CMD_PAUSE;
 	playback_status = AUDIO_STATUS_PAUSED;
-	if (start_secs > 0) {
-		seek_request = true;
-		seek_target_secs = start_secs;
-	}
+	seek_request = start_secs > 0;
+	seek_target_secs = seek_request ? start_secs : -1.0;
 	progress_current_secs = start_secs > 0 ? start_secs : 0;
 	progress_floor_secs = -1.0;
 	progress_total_secs = 0;
@@ -4444,6 +4498,7 @@ void audio_resume(void) {
 void audio_stop(void) {
 	printf("stopping\n");
 	pthread_mutex_lock(&audio_mutex);
+	restart_fresh_pending = false; // explicit stop/card removal cancels cold resume
 	sleep_fade_reset_locked();
 	audio_command = AUDIO_CMD_STOP;
 	playback_status = AUDIO_STATUS_STOPPED;
