@@ -30,6 +30,7 @@ connected = source[start:end]
 start = source.index('\tchar mac[BT_MAC_MAX];', source.index('static void refresh_audio_state(void)'))
 end = source.index('\n\tif (sink) {', start)
 reconcile = source[start:end]
+refresh_job = source.split('case JOB_REFRESH:', 1)[1].split('break;', 1)[0]
 harness = r'''
 #include <assert.h>
 #include <pthread.h>
@@ -39,6 +40,7 @@ harness = r'''
 #include "src/system/bluetooth/bluetooth.h"
 #include "src/system/bluetooth/btstack.h"
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+static bool bus_recovery_incomplete;
 static bool rebind_waiting_device, g_scanning, g_bluealsa_restarted, g_a2dp_connected;
 static bt_state_t g_state;
 static int g_pending_volume;
@@ -56,17 +58,19 @@ void btstack_close(void) { note('C'); }
 bool btstack_bluez_rebind_needed(void) { return bluez_lost; }
 static void refresh_devices(void) { note('D'); }
 static void refresh_audio_state(void) { note('G'); }
+bool btstack_alive(void) { return true; }
 bool btstack_open(void) { note('O'); if (bluez_during_open) bluez_lost = true; return can_open; }
 bool btstack_adapter_ready(void) { note('A'); if (bluez_during_adapter) bluez_lost = true; return adapter; }
 bool btstack_register_agent(void) { note('R'); return true; }
 void btstack_refresh_audio(void) { note('P'); }
 bool btstack_audio_sink(char *out, size_t n) { snprintf(out, n, "AA:BB:CC:DD:EE:FF"); return pcm; }
 unsigned btstack_sink_serial(void) { return 1; }
-''' + recovery + connected + grace + '\nstatic bool eligible_sink(void) {\n' + reconcile + r'''
+''' + recovery + '\nstatic void refresh_job(bool enabled) {\n' + refresh_job + '\n}\n' + connected + grace + '\nstatic bool eligible_sink(void) {\n' + reconcile + r'''
     return sink;
 }
 static void reset(void) {
     memset(trace, 0, sizeof(trace));
+    bus_recovery_incomplete = false;
     g_scanning = true;
     g_pending_volume = 73;
     memset(&g_rx_stream, 1, sizeof(g_rx_stream));
@@ -103,6 +107,13 @@ int main(void) {
     reset(); bluez_lost = false; recover_bus(true, true);
     assert(!strcmp(trace, "CDOARPD")); // preserve the cause across an in-job reopen
 
+    reset(); adapter = false; recover_bus(true, false);
+    memset(trace, 0, sizeof(trace));
+    adapter = true; bluez_lost = false;
+    refresh_job(true); // live bus, delayed Adapter1, no new owner signal
+    assert(!strcmp(trace, "COARPD"));
+    assert(!bus_recovery_incomplete);
+
     g_paired_count = 1;
     snprintf(g_paired[0].mac, sizeof(g_paired[0].mac), "AA:BB:CC:DD:EE:FF");
     g_paired[0].connected = false;
@@ -119,7 +130,7 @@ int main(void) {
     clock_now = 3100; assert(grace_expired());
     a2dp_missing_since = UINT32_MAX - 1000; clock_now = 1998; assert(!grace_expired());
     clock_now = 1999; assert(grace_expired());
-    puts("Rebind order/reconciliation: PASS 20 cases");
+    puts("Rebind order/reconciliation: PASS 21 cases");
     return 0;
 }
 '''

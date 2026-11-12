@@ -150,6 +150,7 @@ static bool worker_running;
 
 static job_t queue[JOB_QUEUE_LEN];
 static int queue_head, queue_count;
+static bool bus_recovery_incomplete; // worker only; Adapter1 may appear after the bus owner
 static bool bus_rebind_pending; // under lock; cannot be lost to a full ring
 static bool bus_bluez_lost_pending; // survives an in-job reopen while the reader retires
 
@@ -2381,6 +2382,7 @@ void bluetooth_power_down_stack(void) {
 }
 
 static void do_power(bool on, bool deliberate) {
+	bus_recovery_incomplete = false; // Explicit power changes run their own stack lifecycle.
 	if (on) {
 		// The bring-up runs every time, not only when a daemon is missing: after
 		// a suspend to RAM all three processes still exist while the radio under
@@ -3014,6 +3016,7 @@ static void publish_bus_loss(bool enabled) {
 }
 
 static void recover_bus(bool enabled, bool bluez_lost) {
+	bus_recovery_incomplete = enabled;
 	bluez_lost |= btstack_bluez_rebind_needed();
 	btstack_close();
 	rebind_waiting_device = true;
@@ -3042,7 +3045,7 @@ static void recover_bus(bool enabled, bool bluez_lost) {
 		}
 		return;
 	}
-	btstack_register_agent();
+	bus_recovery_incomplete = !btstack_register_agent();
 	btstack_refresh_audio();
 	refresh_devices();
 }
@@ -3072,7 +3075,7 @@ static void *bluetooth_worker(void *arg) {
 			// While a sink is missing but its link is still up, the answer is
 			// due within the grace above: the usual poll is far too slow to
 			// give it.
-			if (a2dp_missing_since != 0 && wait_ms > 500) {
+			if ((a2dp_missing_since != 0 || bus_recovery_incomplete) && wait_ms > 500) {
 				wait_ms = 500;
 			}
 			struct timespec deadline;
@@ -3147,7 +3150,7 @@ static void *bluetooth_worker(void *arg) {
 				break;
 
 			case JOB_REFRESH:
-				if (!btstack_alive())
+				if (bus_recovery_incomplete || !btstack_alive())
 					recover_bus(enabled, false);
 				else
 					refresh_devices();
@@ -3274,10 +3277,10 @@ static void *bluetooth_worker(void *arg) {
 		// The backstop. bluez says what changed the moment it happens, so this
 		// only catches what a lost signal or a dropped connection would have
 		// hidden -- including the connection itself having gone.
-		uint32_t poll_period = a2dp_missing_since ? 500 : (power_screen_is_on() ? BT_POLL_MS : BT_POLL_STANDBY_MS);
+		uint32_t poll_period = (a2dp_missing_since || bus_recovery_incomplete) ? 500 : (power_screen_is_on() ? BT_POLL_MS : BT_POLL_STANDBY_MS);
 		if (enabled && (uint32_t)(now_ms() - last_poll) >= poll_period) {
 			last_poll = now_ms();
-			if (!btstack_alive()) {
+			if (bus_recovery_incomplete || !btstack_alive()) {
 				fprintf(stderr, "bluetooth: the bus connection dropped; opening it again\n");
 				recover_bus(enabled, false);
 			} else {
