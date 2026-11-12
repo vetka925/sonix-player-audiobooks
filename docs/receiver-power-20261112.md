@@ -51,6 +51,7 @@ retry, and a successful retry displays aptX/44.1 kHz and playback. Screenshots:
 [failure](receiver-evidence/failure-480x800.png),
 [success](receiver-evidence/success-480x800.png), and
 [empty source list](receiver-evidence/empty-480x720.png).
+The power screen also showed [automatic shutdown enabled at 30 minutes](receiver-evidence/autooff-480x720.png) with no saved preference.
 This validates UI behavior, not real radio interoperability. One independent
 read-only review found no actionable issues; hardware validation remains required.
 
