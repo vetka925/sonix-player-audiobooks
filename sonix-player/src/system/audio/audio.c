@@ -4687,6 +4687,14 @@ void audio_get_output_device(char *out, size_t out_size) {
 
 static int external_frame_bytes = 4;
 static pthread_mutex_t external_lock = PTHREAD_MUTEX_INITIALIZER;
+// Visible before end waits on the writer; concurrent ends cannot be overtaken.
+static atomic_uint external_stopping;
+static bool external_write_cancelled(void) { return atomic_load_explicit(&external_stopping, memory_order_relaxed) != 0; }
+static uint64_t external_clock_ms(void) {
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
 
 // What the open was made on, so a change can be noticed.
 //
@@ -4767,12 +4775,17 @@ static bool external_wait_closed(int ms) {
 #define EXTERNAL_YIELD_WAIT_MS 1000
 
 bool audio_external_begin_latency(int sample_rate, int channels, int bits, int buffer_ms) {
+	if (external_write_cancelled()) return false;
 	// A PCM held by gapless occupies the DAC. Callers here want to open one of
 	// their own on the same device, and without this they find it busy right
 	// after a track has ended on its own.
 	gapless_release();
 
 	pthread_mutex_lock(&external_lock);
+	if (external_write_cancelled()) {
+		pthread_mutex_unlock(&external_lock);
+		return false;
+	}
 
 	// The metronome holds the output only until someone else wants it: asked,
 	// it closes, and this opens the PCM afresh on this source's own terms.
@@ -4781,6 +4794,10 @@ bool audio_external_begin_latency(int sample_rate, int channels, int bits, int b
 		external_wait_closed(EXTERNAL_YIELD_WAIT_MS);
 	}
 
+	if (external_write_cancelled()) {
+		pthread_mutex_unlock(&external_lock);
+		return false;
+	}
 	if (external_pcm) {
 		pthread_mutex_unlock(&external_lock);
 		return true; // already open, and on the same terms
@@ -4893,43 +4910,39 @@ static bool external_follow_output(void) {
 	return true;
 }
 
-// Under external_lock. Waits for room in a PCM that has none, and says whether
-// to go on writing. A Bluetooth PCM that takes nothing for BT_WRITE_STALL_MS
-// is closed and opened again: the transport under it is gone, and without a
-// fresh open every later write would be accepted and never heard.
-static bool external_wait_room(long *last_progress_ms) {
-	long since = log_ms() - *last_progress_ms;
-	if (since < 0) {
-		since = 0; // the millisecond counter wrapped; start the window again
-		*last_progress_ms = log_ms();
-	}
-	if (since >= BT_WRITE_STALL_MS) {
-		fprintf(stderr, "audio: the external source's PCM has taken nothing for %ld ms; re-opening\n", since);
-		snd_pcm_drop(external_pcm);
-		snd_pcm_close(external_pcm);
-		external_pcm = NULL;
-		pcm_device_open = false;
-		if (!external_open_locked()) {
-			fprintf(stderr, "audio: the output would not open again; the external source has nowhere to write\n");
-			return false;
-		}
-		*last_progress_ms = log_ms();
-		return true;
-	}
+// Recover only the handle, in the format of the current converted block.
+// external_open_locked() frees/replans the converter; calling it mid-block
+// would invalidate frames and possibly change their sample width/rate.
+static bool external_reopen_pcm_locked(void) {
+	snd_pcm_drop(external_pcm);
+	snd_pcm_close(external_pcm);
+	external_pcm = NULL;
+	pcm_device_open = false;
+	if (external_write_cancelled())
+		return false;
+	pcm_forced_buffer_ms = external_buffer_ms;
+	snd_pcm_uframes_t period = 0;
+	external_pcm = open_pcm_device(external_channels, external_rate, external_bits, &period);
+	pcm_forced_buffer_ms = 0;
+	pcm_device_open = external_pcm != NULL;
+	// Keep the old route identity. If opening changed it, the next input block
+	// will replan conversion safely, before obtaining any converted pointers.
+	external_checked_ms = 0;
+	return external_pcm != NULL;
+}
 
-	// The same guard pcm_write_bluetooth() has: bluealsa's poll follows its
-	// FIFO and the write follows the transport, so a poll that says "room"
-	// against a write that takes nothing becomes a short sleep, not a spin.
-	if (snd_pcm_wait(external_pcm, 100) > 0) {
+// One bounded poll on every PCM. ALSA's snd_pcm_wait can internally repeat
+// spurious plugin readiness forever. A false-ready/error reply must also
+// yield the CPU; the next write supplies the actual recovery error.
+static void external_wait_room(void) {
+	if (pcm_wait_bluetooth(external_pcm, 50) != 0)
 		usleep(10 * 1000);
-	}
-	return true;
 }
 
 int audio_external_write(const void *frames, int count) {
 	pthread_mutex_lock(&external_lock);
 
-	if (!external_pcm || count <= 0) {
+	if (!external_pcm || count <= 0 || external_write_cancelled()) {
 		pthread_mutex_unlock(&external_lock);
 		return 0;
 	}
@@ -4943,25 +4956,48 @@ int audio_external_write(const void *frames, int count) {
 	}
 
 	int written = 0;
-	long last_progress_ms = log_ms();
+	uint64_t last_progress_ms = external_clock_ms();
+	unsigned recoveries = 0;
+	bool reopened = false;
 	while (written < count) {
-		const void *chunk = (const char *)frames + (size_t)written * external_frame_bytes;
+		if (external_write_cancelled())
+			break;
+		const void *chunk = (const char *)frames + (size_t)written * (size_t)external_frame_bytes;
 		if (pcm_takes_s24(external_pcm, external_bits)) {
 			chunk = s24_from_s32(&external_s24, chunk, (size_t)(count - written) * (size_t)external_channels);
 		}
-		snd_pcm_sframes_t got = chunk ? snd_pcm_writei(external_pcm, chunk, (snd_pcm_uframes_t)(count - written)) : -ENOMEM;
+		snd_pcm_sframes_t got =
+			chunk ? snd_pcm_writei(external_pcm, chunk, (snd_pcm_uframes_t)(count - written)) : -ENOMEM;
 		if (got > 0) {
 			written += (int)got;
-			last_progress_ms = log_ms();
+			last_progress_ms = external_clock_ms();
+			recoveries = 0;
 			continue;
+		}
+		if (external_write_cancelled())
+			break;
+		if (got != 0 && got != -EAGAIN && got != -EPIPE && got != -ESTRPIPE) {
+			fprintf(stderr, "audio: external write failed: %s\n", snd_strerror((int)got));
+			break;
+		}
+		// All recovery paths share this no-progress window. A successful
+		// prepare/resume/open is not evidence that any frames were consumed.
+		uint64_t stalled = external_clock_ms() - last_progress_ms;
+		if (stalled >= BT_WRITE_STALL_MS) {
+			if (!reopened) {
+				reopened = true;
+				fprintf(stderr, "audio: external PCM stalled; one same-format reopen\n");
+				if (external_reopen_pcm_locked())
+					continue; // one write probe; only positive frames reset the clock
+			}
+			fprintf(stderr, "audio: external PCM made no progress for %llu ms; returning partial block\n", (unsigned long long)stalled);
+			break;
 		}
 		if (got == 0 || got == -EAGAIN) {
 			// No room. A bluealsa PCM is opened non-blocking (open_pcm_device),
 			// so the wait that paces the source to real time happens here; the
 			// rest of the chunk is not dropped.
-			if (!external_wait_room(&last_progress_ms)) {
-				break;
-			}
+			external_wait_room();
 			continue;
 		}
 		if (got == -EPIPE) {
@@ -4973,18 +5009,34 @@ int audio_external_write(const void *frames, int count) {
 				external_underrun_logged_ms = log_ms();
 				fprintf(stderr, "audio: the external source ran dry (%u underruns since it opened)\n", external_underruns);
 			}
-			snd_pcm_prepare(external_pcm);
+			int error = snd_pcm_prepare(external_pcm);
+			if (error < 0) {
+				fprintf(stderr, "audio: external prepare failed: %s\n", snd_strerror(error));
+				break;
+			}
+			if (++recoveries > 1)
+				usleep(10 * 1000);
 			continue;
 		}
 		if (got == -ESTRPIPE) {
-			while (snd_pcm_resume(external_pcm) == -EAGAIN) {
-				usleep(100 * 1000);
+			int error = -EAGAIN;
+			while (error == -EAGAIN && !external_write_cancelled() && external_clock_ms() - last_progress_ms < BT_WRITE_STALL_MS) {
+				error = snd_pcm_resume(external_pcm);
+				if (error == -EAGAIN)
+					usleep(20 * 1000);
 			}
-			snd_pcm_prepare(external_pcm);
+			if (external_write_cancelled())
+				break;
+			if (error == -EAGAIN)
+				continue; // the shared deadline handles this failure too
+			if (error < 0 && (error = snd_pcm_prepare(external_pcm)) < 0) {
+				fprintf(stderr, "audio: external resume/prepare failed: %s\n", snd_strerror(error));
+				break;
+			}
+			if (++recoveries > 1)
+				usleep(10 * 1000);
 			continue;
 		}
-		fprintf(stderr, "audio: external write failed: %s\n", snd_strerror((int)got));
-		break;
 	}
 
 	pthread_mutex_unlock(&external_lock);
@@ -4992,6 +5044,7 @@ int audio_external_write(const void *frames, int count) {
 }
 
 void audio_external_end(void) {
+	atomic_fetch_add_explicit(&external_stopping, 1, memory_order_relaxed);
 	pthread_mutex_lock(&external_lock);
 
 	if (external_pcm) {
@@ -5006,4 +5059,5 @@ void audio_external_end(void) {
 	}
 
 	pthread_mutex_unlock(&external_lock);
+	atomic_fetch_sub_explicit(&external_stopping, 1, memory_order_relaxed);
 }
