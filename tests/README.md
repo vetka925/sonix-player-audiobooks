@@ -69,3 +69,13 @@ phone should appear, not the fixture headphones. The first tap fails after
 show progress/error/success, and prevent duplicate taps while pending.
 `SONIX_TEST_NO_SOURCES=1` exercises first-pairing instructions with no list.
 These tests do not prove RF interoperability or sound on a physical device.
+
+## Selected fork regressions
+
+`sh tests/run-fork-tests.sh` runs Linux/ALSA fixtures for idle workers, mono routing,
+failed-open position, external PCM cancellation, slow-resume command races,
+LVGL input frames, private D-Bus owner loss, queue priority, and fork/exec FD
+ownership. It is included in the full audiobook suite. Hardware boundaries are
+injected; D-Bus tests use a private temporary daemon, never the system bus.
+Upstream-derived fixtures and helpers are adapted from Rekkod v1.4.2; source
+commits and scope are recorded in the implementation plan and report.

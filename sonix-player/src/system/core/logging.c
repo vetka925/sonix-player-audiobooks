@@ -8,6 +8,9 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
+#include <sys/resource.h>
+#include <sys/sysmacros.h>
 #include <pthread.h>
 #include <semaphore.h>
 #include <stdio.h>
@@ -438,6 +441,12 @@ void logging_flush(void) {
 
 #define RELAY_LINE_MAX 512
 
+static int child_fd_limit = -1;
+static void child_fd_limit_init(void) {
+	struct rlimit limit;
+	child_fd_limit = getrlimit(RLIMIT_NOFILE, &limit) == 0 && limit.rlim_cur <= INT_MAX ? (int)limit.rlim_cur : -1;
+}
+
 static int relay_read = -1;
 static int relay_write = -1;
 
@@ -505,7 +514,54 @@ static void relay_start(void) {
 	pthread_attr_destroy(&tattr);
 }
 
-void logging_child_stdio(void) {
+#if defined(__has_attribute)
+#if __has_attribute(no_profile_instrument_function)
+#define CHILD_NO_PROFILE __attribute__((no_profile_instrument_function))
+#endif
+#endif
+#ifndef CHILD_NO_PROFILE
+#if defined(__GNUC__) && !defined(__clang__) && __GNUC__ >= 9
+#define CHILD_NO_PROFILE __attribute__((no_profile_instrument_function))
+#else
+#define CHILD_NO_PROFILE
+#endif
+#endif
+
+CHILD_NO_PROFILE void logging_child_stdio(void) {
+	// Daemons must not retain a decoder's open track (some third-party
+	// decoders do not use O_CLOEXEC). Set flags in the forked child's own FD
+	// table, before making the deliberate stdout/stderr and relay-reader dup.
+	// Only async-signal-safe operations are used between fork and exec.
+	if (child_fd_limit < 0) {
+		_exit(127);
+	}
+	for (int fd = 3; fd < child_fd_limit; fd++) {
+		int rc;
+		do {
+			rc = fcntl(fd, F_SETFD, FD_CLOEXEC);
+		} while (rc < 0 && errno == EINTR);
+		if (rc < 0) {
+			if (errno == EBADF)
+				continue;
+			_exit(127);
+		}
+		struct stat st;
+		do {
+			rc = fstat(fd, &st);
+		} while (rc < 0 && errno == EINTR);
+		if (rc < 0) {
+			if (errno == EBADF)
+				continue;
+			_exit(127);
+		}
+		// CLOEXEC alone retains hardware until exec (including GCOV flush).
+		// Release only this child's sound reference before reaching that step.
+		if (S_ISCHR(st.st_mode) && major(st.st_rdev) == 116) {
+			// Linux releases the FD entry even on EINTR: never retry close.
+			if (close(fd) < 0 && errno != EINTR && errno != EBADF)
+				_exit(127);
+		}
+	}
 	if (relay_write < 0) {
 		return;
 	}
@@ -642,6 +698,7 @@ static bool redirect_to(FILE *stream) {
 }
 
 void logging_init(void) {
+	child_fd_limit_init();
 	stamp_install();
 	queue_start();
 	relay_start();
