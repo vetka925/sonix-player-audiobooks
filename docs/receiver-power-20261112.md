@@ -58,11 +58,27 @@ read-only review found no actionable issues; hardware validation remains require
 Firmware SHA-256 (build server and local downloaded copy match):
 `17bd8bbf741e600d76ade1e6974f054788774abd559b77d748ca5cf6c659358f`.
 
-Standby measurement and on-device acceptance are pending. The owner started a
-30-minute test with playback stopped, Bluetooth/Wi-Fi off, USB unplugged, and
-screen off. Baseline reported capacity was 100%; the endpoint must be recorded
-before charging. The current evidence does not identify the historical drain's
-cause, and default auto-off is a mitigation rather than a suspend-current fix.
+## Standby measurement result
+
+On 2026-11-12 the owner reported 100% before and 100% after the unplugged test,
+with Bluetooth/Wi-Fi disabled and playback stopped. The device log records screen
+off at 14:29:51, suspend entry at 14:30:52, and power-button wake at 15:22:28:
+3,095 seconds continuously suspended (51 minutes 35 seconds). Kernel suspend
+successes increased from 14 to 15, failures stayed zero. The endpoint was reported
+before charging; the later USB reading also showed 100% and 4.393 V.
+
+Fast drain did not reproduce under these conditions. The battery gauge at 100%
+does not measure small losses accurately, so this is not a quantified current or
+battery-health test. Historical discharge remains unexplained. Before this test,
+during the Bluetooth receiving experiment, the log recorded sleep deferred because
+Bluetooth was in use. Code intentionally blocks deep sleep for a connected audio
+link, scanning/pairing jobs, or enabled SonixLink. A dark display therefore does
+not guarantee deep sleep. This is a plausible condition to investigate if the
+problem recurs, not proof of the historical cause.
+
+Default automatic shutdown bounds idle radio-connected operation; actual incoming
+audio is included in the playing predicate and keeps the timer from expiring.
+Hardware installation/receiver acceptance is still pending.
 
 ## Upstream assessment (checked 2026-11-12)
 
