@@ -127,7 +127,7 @@ Candidate: build `121120260947`, 48,029,696 bytes. Release artifact: `r1.upt`.
 SHA-256 matches the build server:
 `4825d7fceaf2ec9987c5db91be1e4927f2aa02fa6c79a5a89c8eaffd8fb9152e`.
 The October 22 rollback image remains beside it. Installation is recorded below;
-no public push has been performed.
+the source and release are published to the owner-authorized audiobook fork.
 
 Hardware acceptance remains: Fold7 connection/reconnection without ADB,
 continuous wired receiver audio, pause/resume and position retention on books,

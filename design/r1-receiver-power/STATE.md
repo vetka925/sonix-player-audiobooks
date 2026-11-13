@@ -9,7 +9,8 @@
   adapter initialization finding was fixed with a failing-then-passing regression.
 - Branch: `codex/r1-receiver-power-20261112`, based on audiobook fork `aa2873f`.
 - Evidence: [report](../../docs/receiver-power-20261112.md).
-- Firmware build `121120260947` is installed; public publication has not been performed.
+- Firmware build `121120260947` is installed; publication as `audiobooks-v1.1.0`
+  was explicitly authorized by the owner.
 - Standby result: owner reported 100% to 100%; log confirms 3,095 seconds
   uninterrupted suspend and zero failures. Historical drain did not reproduce.
 - Owner reported “все работает” after the requested unplugged Receiver audio
