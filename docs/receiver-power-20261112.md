@@ -78,7 +78,7 @@ problem recurs, not proof of the historical cause.
 
 Default automatic shutdown bounds idle radio-connected operation; actual incoming
 audio is included in the playing predicate and keeps the timer from expiring.
-Hardware installation/receiver acceptance is still pending.
+At this measurement stage, installation/receiver acceptance was pending; see the installation receipt below.
 
 ## Upstream assessment (checked 2026-11-12)
 
@@ -127,8 +127,8 @@ Candidate: build `121120260947`, 48,029,696 bytes. Local artifact:
 `/Users/vetka/Downloads/HiBy-R1-2026-11-12/r1.upt`.
 SHA-256 matches the build server:
 `4825d7fceaf2ec9987c5db91be1e4927f2aa02fa6c79a5a89c8eaffd8fb9152e`.
-The October 22 rollback image remains beside it. No firmware installation or
-public push has been performed.
+The October 22 rollback image remains beside it. Installation is recorded below;
+no public push has been performed.
 
 Hardware acceptance remains: Fold7 connection/reconnection without ADB,
 continuous wired receiver audio, pause/resume and position retention on books,
@@ -148,3 +148,25 @@ The selected-fix LVGL simulator repeated the 480x800 Receiver journey with
 a fake radio boundary: [failed connect](receiver-evidence/fork-failure-480x800.png)
 then [successful retry](receiver-evidence/fork-success-480x800.png). This is UI
 evidence only; the final delayed-adapter fix is covered by the lifecycle test.
+
+## Installation receipt — 2026-11-13
+
+The owner explicitly authorized installation and connected R1 with ADB enabled.
+Before updating, model was verified as HiBy R1, old build `221020260658`, battery
+98% and charging. The complete candidate was copied under a temporary filename;
+its on-device SHA-256 matched the candidate above before activation. The old
+card image was retained as `/mnt/sd_0/r1-20261022.upt.rollback`.
+
+The stock `/usr/bin/bootmode.sh Recovery` path armed recovery, followed by sync
+and reboot. After recovery, ADB returned (serial changed from `dev` to
+`ingenic_`), system-info reported build `121120260947`, and Sonix remained alive
+across checks. Installed `/usr/bin/sonix_player` SHA-256 matches the build output:
+`0d5901b458461fcf4a4e5c86b8a57f0e944c38a3fa812aee841ea7f8f01558b2`.
+The card mounted normally and rollback remained present. The new startup log had
+no error/failure/fatal/assertion/segfault markers. Configuration comparison found
+only `player.volume` changed; no settings were overwritten by the installer.
+Private before/after settings and boot log remain in local diagnostics, outside Git.
+
+Installation and boot are verified. Phone interoperability, audible output,
+audiobook behavior and standby consumption still require the owner's real-device
+test; a running process is not evidence that those paths work.
