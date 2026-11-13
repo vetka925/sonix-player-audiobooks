@@ -1,7 +1,7 @@
 # R1 receiver and power repair state
 
 - Date: 2026-11-12.
-- Stage: installed on R1 on 2026-11-13; boot verified; real audio acceptance pending.
+- Stage: installed and accepted by the owner on 2026-11-13; release prepared.
 - Scope approved by the owner's direct request to fix receiver reconnection and
   investigate standby drain. No repeated start gate; timeout not applicable.
 - Execution: one Codex writer; exact model unknown (not exposed in this session).
@@ -12,8 +12,10 @@
 - Firmware build `121120260947` is installed; public publication has not been performed.
 - Standby result: owner reported 100% to 100%; log confirms 3,095 seconds
   uninterrupted suspend and zero failures. Historical drain did not reproduce.
-- Next: owner tests phone-to-R1 audio and reconnection without ADB, then
-  audiobook pause/resume and longer unplugged standby.
+- Owner reported “все работает” after the requested unplugged Receiver audio
+  and reconnection check, and explicitly authorized GitHub publication.
+- Longer standby measurement and exhaustive hardware fault testing remain outside
+  this acceptance; no quantified battery-life improvement is claimed.
 
 - Selected fork changes are implemented: idle workers, mono routing and position
   retention, bounded receiver recovery, responsive resume and touch frames,

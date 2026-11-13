@@ -123,8 +123,7 @@ were checked for the new behavior. The complete Linux audiobook suite including
 no symbol beyond glibc 2.22. Target symbol inspection found no simulator wrappers.
 `git diff --check` passed. Existing service versions and kernel are unchanged.
 
-Candidate: build `121120260947`, 48,029,696 bytes. Local artifact:
-`/Users/vetka/Downloads/HiBy-R1-2026-11-12/r1.upt`.
+Candidate: build `121120260947`, 48,029,696 bytes. Release artifact: `r1.upt`.
 SHA-256 matches the build server:
 `4825d7fceaf2ec9987c5db91be1e4927f2aa02fa6c79a5a89c8eaffd8fb9152e`.
 The October 22 rollback image remains beside it. Installation is recorded below;
@@ -170,3 +169,11 @@ Private before/after settings and boot log remain in local diagnostics, outside 
 Installation and boot are verified. Phone interoperability, audible output,
 audiobook behavior and standby consumption still require the owner's real-device
 test; a running process is not evidence that those paths work.
+
+## Owner acceptance and publication — 2026-11-13
+
+After being asked to unplug USB and test Receiver audio plus reconnection, the
+owner reported “все работает” and explicitly requested GitHub publication,
+release notes and README updates. This supports the tested phone/receiver flow;
+it does not establish quantified standby savings or exhaustive fault coverage.
+Release notes: [Audiobooks v1.1.0](releases/audiobooks-v1.1.0.md).

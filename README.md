@@ -51,6 +51,26 @@ and books stored as folders. This fork builds on that work:
 Also includes fixes for Cyrillic grouping, ID3 chapter titles, and update attempts
 when the memory card is unavailable. See [FEATURES.md](FEATURES.md) for the full player.
 
+## Receiver and reliability improvements in v1.1.0
+
+Use the R1 as a Bluetooth receiver for your phone, with wired headphones plugged
+into the player. Pair the phone, open **Bluetooth → Receiver**, and tap the phone
+in the source list. Keep Receiver open while connecting. A failed connection can
+be retried from the same page; headphones are excluded from the source list.
+The owner confirmed phone audio and reconnection worked on the R1 after updating.
+
+This release also preserves playback position after output failures, improves
+pause/resume responsiveness and touch handling, fixes mono output to Bluetooth
+headphones, and reduces unnecessary idle worker wake-ups.
+
+Automatic shutdown defaults to **30 idle minutes** when no preference was saved.
+An explicit disabled setting is preserved. Adjust it in **Settings → Power**.
+Incoming receiver audio counts as playback. A dark screen does not always mean
+deep sleep, and this release does not claim a measured battery-life improvement.
+
+See the [v1.1.0 release notes](docs/releases/audiobooks-v1.1.0.md) for changes,
+validation, credits and remaining limits.
+
 ## Install on HiBy R1
 
 **This release is for the HiBy R1 only.** The owner has confirmed the build works
