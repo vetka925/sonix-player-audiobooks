@@ -1,4 +1,5 @@
 #include "streaming.h"
+#include "youtubepage.h"
 
 #include "lvgl/lvgl.h"
 
@@ -14,6 +15,7 @@ lv_obj_t *streaming_screen;
 
 void streaming_init(gui_config_t *cfg) {
 	qobuzpage_init(cfg);
+	youtubepage_init(cfg);
 	tidalpage_init(cfg);
 	podcastpage_init(cfg);
 
@@ -22,6 +24,7 @@ void streaming_init(gui_config_t *cfg) {
 		{"qobuz", &icon_menu_qobuz, &qobuz_screen, NULL},
 		{"radio", &icon_menu_radio, &radiopage_screen, NULL},
 		{"podcasts", &icon_menu_podcast, &podcast_screen, NULL},
+		{"YouTube Music", &icon_menu_radio, &youtube_screen, NULL},
 	};
 
 	// Two columns and three rows of tile, exactly like Music and Wireless, so a

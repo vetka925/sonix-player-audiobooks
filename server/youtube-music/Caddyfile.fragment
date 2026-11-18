@@ -1,0 +1,7 @@
+	@sonixmusic path /sonix-music/*
+	log_skip @sonixmusic
+	handle_path /sonix-music/* {
+		reverse_proxy sonix-youtube:18765 {
+			flush_interval -1
+		}
+	}
