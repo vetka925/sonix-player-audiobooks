@@ -251,10 +251,14 @@ def track_file(track, expires, ticket):
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "source"
             output = Path(directory) / "track.opus"
-            subprocess.run([sys.executable, "-m", "yt_dlp", "--no-playlist", "--quiet", "--write-info-json",
-                            "--socket-timeout", "15", "--retries", "1", "--max-filesize", "240M",
-                            "-f", "bestaudio[acodec=opus]", "-o", str(source),
-                            "https://music.youtube.com/watch?v=" + track], capture_output=True, timeout=120, check=True)
+            if (state / "playback" / "oauth.json").is_file():
+                command = [sys.executable, "-m", "account_audio", track, str(source)]
+            else:
+                command = [sys.executable, "-m", "yt_dlp", "--no-playlist", "--quiet", "--write-info-json",
+                           "--socket-timeout", "15", "--retries", "1", "--max-filesize", "240M",
+                           "-f", "bestaudio[acodec=opus]", "-o", str(source),
+                           "https://music.youtube.com/watch?v=" + track]
+            subprocess.run(command, capture_output=True, timeout=120, check=True)
             info = json.loads(source.with_suffix(".info.json").read_text())
             subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-i", str(source),
                             "-map", "0:a:0", "-c:a", "copy", str(output)], capture_output=True, timeout=40, check=True)

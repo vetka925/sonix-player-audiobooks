@@ -1,5 +1,6 @@
 ytmusicapi==1.12.4
-yt-dlp==2026.10.26
+# SABR transport from upstream yt-dlp PR 13515, pinned to the tested revision.
+yt-dlp[default] @ https://github.com/coletdjnz/yt-dlp-dev/archive/b7685f01f1c9b61c9b1293bf86ac4400d3748f0f.tar.gz
 Flask>=3.1,<4
 gunicorn>=23,<27
 mutagen==1.47.0
