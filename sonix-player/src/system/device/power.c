@@ -48,6 +48,7 @@
 #include "src/system/device/axpcharge.h"
 #include "src/system/device/chargescreen.h"
 #include "src/gui/shell/gui.h"
+#include "src/gui/streaming/youtubepage.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -621,7 +622,7 @@ static bool wifi_in_use(void) {
 	// A scan or a connect in flight counts as use: parking the radio out from
 	// under wpa_supplicant mid-association leaves the driver to sort out a
 	// teardown it did not expect.
-	return wifi_busy() || wifi_scan_running() || streaming_playback_active() || airplay_get_enabled() ||
+	return youtube_offline_downloading() || wifi_busy() || wifi_scan_running() || streaming_playback_active() || airplay_get_enabled() ||
 		   dlna_get_enabled() || sonixlink_get_enabled() ||
 		   wifitransfer_get_enabled() || qobuzcache_downloading_id() > 0 ||
 		   qobuzcache_network_wanted() || tidalcache_downloading_id() > 0 || tidalcache_network_wanted() ||

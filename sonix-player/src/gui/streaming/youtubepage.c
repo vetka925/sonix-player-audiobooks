@@ -5,6 +5,8 @@
 #include <utime.h>
 #include <time.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
+#include <stdatomic.h>
 #include <unistd.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -12,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "src/gui/library/browser.h"
 #include "src/gui/shell/icons.h"
 #include "src/gui/shell/keyboard.h"
 #include "src/gui/shell/settingsrow.h"
@@ -35,6 +38,7 @@ typedef struct {
 	char kind[16], query[301];
 	int offset;
 	char ids[40][12];
+	char title[180];
 	int count;
 } results_t;
 static results_t catalog, tracks;
@@ -52,8 +56,8 @@ static void request_page(results_t *view, const char *kind, const char *query, i
 
 static bool config(char *base, size_t size, char *header, size_t header_size) {
 	char file[512], token[100];
-	const char *root = storage_sd_root();
-	if (!root) return false;
+	const char *root = playlist_card_root();
+	if (!root || !*root) return false;
 	snprintf(file, sizeof(file), "%s/youtube-music.conf", root);
 	FILE *f = fopen(file, "r");
 	if (!f) return false;
@@ -117,7 +121,7 @@ static bool cache_room(const char *path, long incoming) {
 	}
 }
 
-static bool fetch_opus(download_t *job) {
+static bool fetch_opus(download_t *job, bool offline) {
 	char base[240], header[128], url[512], part[530];
 	if (!config(base, sizeof(base), header, sizeof(header))) return false;
 	snprintf(url, sizeof(url), "%s/track-ticket/%s", base, job->id);
@@ -137,7 +141,12 @@ static bool fetch_opus(download_t *job) {
 	FILE *out = fopen(part, "wb");
 	long received = 0;
 	const long max_size = 256L * 1024 * 1024;
-	ok = out && stream.content_length > 0 && stream.content_length <= max_size && cache_room(job->path, stream.content_length);
+	struct statvfs space;
+	bool valid_length = stream.content_length > 0 && stream.content_length <= max_size;
+	bool room = valid_length && (offline ? out && !statvfs(part, &space) &&
+		(unsigned long long)space.f_bavail * space.f_frsize >= (unsigned long long)stream.content_length :
+		cache_room(job->path, stream.content_length));
+	ok = out && room;
 	while (ok && received < stream.content_length) {
 		char buffer[16384];
 		int n = http_stream_read(&stream, buffer, sizeof(buffer));
@@ -167,15 +176,15 @@ static void downloaded(void *arg) {
 static void *download_worker(void *arg) {
 	download_t *job = arg;
 	pthread_mutex_lock(&download_lock);
-	job->ok = !access(job->path, R_OK) || fetch_opus(job);
+	job->ok = !access(job->path, R_OK) || fetch_opus(job, false);
 	pthread_mutex_unlock(&download_lock);
 	if (!gui_post(downloaded, job)) free(job);
 	return NULL;
 }
 
 static bool prepare_opus(const char *path) {
-	const char *root = storage_sd_root();
-	if (!root) return true;
+	const char *root = playlist_card_root();
+	if (!root || !*root) return true;
 	char prefix[512];
 	snprintf(prefix, sizeof(prefix), "%s/.local/youtube/", root);
 	if (strncmp(path, prefix, strlen(prefix))) return true;
@@ -197,11 +206,38 @@ static bool prepare_opus(const char *path) {
 	return false;
 }
 
+// Some touch releases arrive as clicks at the edge of a scrolling list.
+static lv_point_t press_start;
+static bool dragged;
+static void track_touch(lv_event_t *e) {
+	lv_indev_t *in = lv_indev_active();
+	if (!in || lv_indev_get_type(in) != LV_INDEV_TYPE_POINTER) return;
+	lv_point_t point;
+	lv_indev_get_point(in, &point);
+	if (lv_event_get_code(e) == LV_EVENT_PRESSED) {
+		press_start = point;
+		dragged = lv_indev_get_scroll_obj(in) != NULL;
+	} else if (abs(point.y - press_start.y) > 10 || abs(point.x - press_start.x) > 10 ||
+			   lv_indev_get_scroll_obj(in)) dragged = true;
+}
+
+static bool drag_click(void) {
+	lv_indev_t *in = lv_indev_active();
+	return in && lv_indev_get_type(in) == LV_INDEV_TYPE_POINTER && dragged;
+}
+
+static void guard_row(lv_obj_t *row) {
+	lv_obj_add_event_cb(row, track_touch, LV_EVENT_PRESSED, NULL);
+	lv_obj_add_event_cb(row, track_touch, LV_EVENT_PRESSING, NULL);
+	lv_obj_add_event_cb(row, track_touch, LV_EVENT_RELEASED, NULL);
+}
+
 static void play_cb(lv_event_t *e) {
+	if (drag_click()) return;
 	results_t *view = lv_screen_active() == tracks.screen ? &tracks : &catalog;
 	int index = (int)(intptr_t)lv_event_get_user_data(e);
-	const char *root = storage_sd_root();
-	if (!root || index < 0 || index >= view->count) return;
+	const char *root = playlist_card_root();
+	if (!root || !*root || index < 0 || index >= view->count) return;
 	char dir[512], paths[40][512];
 	const char *queue[40];
 	snprintf(dir, sizeof(dir), "%s/.local/youtube", root);
@@ -213,14 +249,16 @@ static void play_cb(lv_event_t *e) {
 		snprintf(paths[i], sizeof(paths[i]), "%s/.local/youtube/%s.opus", root, view->ids[i]);
 		queue[i] = paths[i];
 	}
-	if (access(paths[index], R_OK)) toast_plain("Loading YouTube Music track…");
 	device_state_play_list(queue, view->count, index);
 	player_refresh_now_playing();
 	player_sheet_open(true);
 }
 
 static void playlist_cb(lv_event_t *e) {
+	if (drag_click()) return;
 	const char *id = lv_event_get_user_data(e);
+	lv_obj_t *row = lv_event_get_current_target(e);
+	snprintf(tracks.title, sizeof(tracks.title), "%s", lv_label_get_text(settingsrow_name_label(row)));
 	request_page(&tracks, "playlist", id, 0);
 }
 
@@ -229,6 +267,7 @@ static void free_id(lv_event_t *e) {
 }
 
 static void page_cb(lv_event_t *e) {
+	if (drag_click()) return;
 	results_t *view = lv_screen_active() == tracks.screen ? &tracks : &catalog;
 	int offset = view->offset + (int)(intptr_t)lv_event_get_user_data(e);
 	request_page(view, view->kind, view->query, offset);
@@ -274,6 +313,124 @@ static const char *load_catalog(const char *url, const char *header, char **body
 	return catalog_wifi_ready() ? "Cannot reach YouTube Music" : "Wi-Fi did not connect";
 }
 
+typedef struct {
+	char kind[16], query[301], folder[320], message[128];
+} offline_job_t;
+
+static atomic_bool offline_busy, offline_cancel;
+
+bool youtube_offline_downloading(void) { return atomic_load(&offline_busy); }
+
+static void safe_name(char *out, size_t size, const char *text) {
+	size_t n = 0;
+	while (*text && n + 1 < size) {
+		unsigned char c = *text;
+		size_t bytes = c < 128 ? 1 : c < 224 ? 2 : c < 240 ? 3 : 4;
+		if (n + bytes >= size || strlen(text) < bytes) break;
+		if (bytes == 1 && (c < 32 || strchr("/\\:*?\"<>|", c))) out[n++] = '_';
+		else { memcpy(out + n, text, bytes); n += bytes; }
+		text += bytes;
+	}
+	while (n && (out[n-1] == '.' || out[n-1] == ' ')) n--;
+	if (!n) out[n++] = '_';
+	out[n] = 0;
+}
+
+static bool offline_root(char *dir, size_t size) {
+	const char *root = playlist_card_root();
+	return root && *root && snprintf(dir, size, "%s/YouTube Music", root) < (int)size &&
+		(mkdir(dir, 0755) == 0 || errno == EEXIST);
+}
+
+static void offline_open(lv_event_t *e) {
+	(void)e;
+	char dir[320];
+	if (!offline_root(dir, sizeof(dir))) { gui_notify_popup("Check the SD card"); return; }
+	browser_open_dir_public(dir);
+	switch_screen(browser_screen);
+}
+
+static void offline_done(void *arg) {
+	offline_job_t *job = arg;
+	atomic_store(&offline_busy, false);
+	gui_notify_popup(job->message);
+	free(job);
+}
+
+static void *offline_worker(void *arg) {
+	offline_job_t *job = arg;
+	char base[240], header[128], query[910], url[1450];
+	int saved = 0;
+	const char *error = NULL;
+	bool more = true;
+	if (!config(base, sizeof(base), header, sizeof(header))) error = "Check youtube-music.conf";
+	http_url_encode(job->query, query, sizeof(query));
+	for (int offset = 0; more && !error && !atomic_load(&offline_cancel); offset += 40) {
+		snprintf(url, sizeof(url), "%s/catalog/%s?q=%s&offset=%d", base, job->kind, query, offset);
+		char *body = NULL;
+		error = load_catalog(url, header, &body);
+		more = false;
+		char *next = NULL;
+		for (char *line = body ? strtok_r(body, "\n", &next) : NULL;
+			 line && !error && !atomic_load(&offline_cancel); line = strtok_r(NULL, "\n", &next)) {
+			char *fields = NULL;
+			char *kind = strtok_r(line, "\t", &fields);
+			char *id = strtok_r(NULL, "\t", &fields);
+			char *title = strtok_r(NULL, "\t", &fields);
+			if (kind && !strcmp(kind, "more")) { more = true; continue; }
+			if (!kind || strcmp(kind, "song") || !id || !valid_id(id) || !title) continue;
+			char name[145];
+			safe_name(name, sizeof(name), title);
+			download_t track = {0};
+			strcpy(track.id, id);
+			snprintf(track.path, sizeof(track.path), "%s/%s [%s].opus", job->folder, name, id);
+			if (access(track.path, R_OK) && !fetch_opus(&track, true)) error = "Check Wi-Fi and free space";
+			else saved++;
+		}
+		free(body);
+	}
+	snprintf(job->message, sizeof(job->message), "%d tracks available offline. %s", saved,
+			 error ? error : atomic_load(&offline_cancel) ? "Download stopped" : "Download complete");
+	if (!gui_post(offline_done, job)) { atomic_store(&offline_busy, false); free(job); }
+	return NULL;
+}
+
+static void save_offline(lv_event_t *e) {
+	if (drag_click()) return;
+	if (youtube_offline_downloading()) { gui_notify_popup("An offline download is in progress"); return; }
+	results_t *v = lv_event_get_user_data(e);
+	offline_job_t *job = calloc(1, sizeof(*job));
+	if (!job) return;
+	char dir[160], name[95];
+	safe_name(name, sizeof(name), v == &tracks ? v->title :
+			  !strcmp(v->kind, "likes") ? "Liked songs" : "Library songs");
+	if (!offline_root(dir, sizeof(dir))) goto fail;
+	int len = v == &tracks ? snprintf(job->folder, sizeof(job->folder), "%s/%s [%s]", dir, name, v->query) :
+		snprintf(job->folder, sizeof(job->folder), "%s/%s", dir, name);
+	if (len >= (int)sizeof(job->folder) || (mkdir(job->folder, 0755) && errno != EEXIST)) goto fail;
+	strcpy(job->kind, v->kind);
+	strcpy(job->query, v->query);
+	atomic_store(&offline_cancel, false);
+	atomic_store(&offline_busy, true);
+	pthread_t worker;
+	if (!pthread_create(&worker, NULL, offline_worker, job)) {
+		pthread_detach(worker);
+		gui_notify_popup("Saving tracks to Offline music");
+		return;
+	}
+	atomic_store(&offline_busy, false);
+fail:
+	free(job);
+	gui_notify_popup("Cannot start offline download");
+}
+
+static void cancel_offline(lv_event_t *e) {
+	(void)e;
+	bool busy = youtube_offline_downloading();
+	if (busy) atomic_store(&offline_cancel, true);
+	gui_notify_popup(busy ? "Stopping after the current track" : "No download in progress");
+}
+
 static void show_response(void *arg) {
 	request_t *r = arg;
 	results_t *v = r->view;
@@ -284,7 +441,9 @@ static void show_response(void *arg) {
 		list_message(v->list, r->error);
 		goto done;
 	}
-	if (r->offset) settingsrow_add(v->list, "Previous page", NULL, page_cb, (void *)(intptr_t)-40);
+	if (r->body && *r->body && (!strcmp(r->kind, "likes") || !strcmp(r->kind, "songs") || !strcmp(r->kind, "playlist")))
+		guard_row(settingsrow_action(v->list, "Save list offline", save_offline, v));
+	if (r->offset) guard_row(settingsrow_add(v->list, "Previous page", NULL, page_cb, (void *)(intptr_t)-40));
 	char *next = NULL;
 	for (char *line = strtok_r(r->body, "\n", &next); line; line = strtok_r(NULL, "\n", &next)) {
 		char *fields = NULL;
@@ -294,17 +453,20 @@ static void show_response(void *arg) {
 		char *path = strtok_r(NULL, "\t", &fields);
 		if (!kind || !id || !title || !path) continue;
 		if (!strcmp(kind, "more")) {
-			settingsrow_add(v->list, "Next page", NULL, page_cb, (void *)(intptr_t)40);
+			guard_row(settingsrow_add(v->list, "Next page", NULL, page_cb, (void *)(intptr_t)40));
 		} else if (!strcmp(kind, "playlist")) {
 			char *copy = strdup(id);
 			if (!copy) continue;
 			lv_obj_t *row = settingsrow_add(v->list, title, NULL, playlist_cb, copy);
+			guard_row(row);
 			lv_obj_add_event_cb(row, free_id, LV_EVENT_DELETE, copy);
 		} else if (!strcmp(kind, "song") && !strncmp(path, "audio/", 6) && v->count < 40) {
 			if (!valid_id(id)) continue;
 			int index = v->count++;
 			strcpy(v->ids[index], id);
-			settingsrow_name_lines(settingsrow_add(v->list, title, NULL, play_cb, (void *)(intptr_t)index), 2);
+			lv_obj_t *row = settingsrow_add(v->list, title, NULL, play_cb, (void *)(intptr_t)index);
+			guard_row(row);
+			settingsrow_name_lines(row, 2);
 		}
 	}
 	if (!lv_obj_get_child_count(v->list))
@@ -373,6 +535,8 @@ void youtubepage_init(gui_config_t *cfg) {
 	settingsrow_add(home, "Library songs", NULL, browse_cb, "songs");
 	settingsrow_add(home, "Liked songs", NULL, browse_cb, "likes");
 	settingsrow_add(home, "My playlists", NULL, browse_cb, "playlists");
+	settingsrow_add(home, "Offline music", NULL, offline_open, NULL);
+	settingsrow_action(home, "Stop offline download", cancel_offline, NULL);
 	catalog.list = settingsrow_page(catalog.screen, cfg, "YouTube Music");
 	tracks.list = settingsrow_page(tracks.screen, cfg, "Playlist");
 	lv_obj_add_style(search_screen, &theme_style_screen, 0);
