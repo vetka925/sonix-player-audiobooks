@@ -3,6 +3,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <utime.h>
+#include <time.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <pthread.h>
@@ -20,6 +21,7 @@
 #include "src/gui/nowplaying/player.h"
 #include "src/system/device/system.h"
 #include "src/system/net/http.h"
+#include "src/system/net/wifi.h"
 #include "src/system/playback/device_state.h"
 #include "src/system/playback/playlist.h"
 
@@ -232,6 +234,46 @@ static void page_cb(lv_event_t *e) {
 	request_page(view, view->kind, view->query, offset);
 }
 
+static void list_message(lv_obj_t *list, const char *message) {
+	lv_obj_t *label = lv_label_create(list);
+	lv_obj_add_style(label, &theme_style_text, 0);
+	lv_label_set_text(label, message);
+}
+
+static bool catalog_wifi_ready(void) {
+#ifdef HOST_BUILD
+	return true; // The desktop simulator uses the host network.
+#else
+	return wifi_interface_address(NULL, 0);
+#endif
+}
+
+// Waking the display starts association asynchronously. DHCP and the resolver
+// may become ready at different times, so retry transport failures only.
+static const char *load_catalog(const char *url, const char *header, char **body) {
+	struct timespec start, now;
+	clock_gettime(CLOCK_MONOTONIC, &start);
+	do {
+		if (catalog_wifi_ready()) {
+			size_t length = 0;
+			int status = 0;
+			if (http_get_ex(url, header, false, body, &length, 65536, 35, &status) && status == 200)
+				return NULL;
+			free(*body);
+			*body = NULL;
+			if (status == 409) return "Link Google on Rabisu to open your library";
+			if (status == 401) return "Check the device key on the SD card";
+			if (status > 0) return "YouTube Music unavailable";
+			sleep(1);
+		} else {
+			if (!wifi_get_enabled()) return "Turn on Wi-Fi to open YouTube Music";
+			usleep(250000);
+		}
+		clock_gettime(CLOCK_MONOTONIC, &now);
+	} while (now.tv_sec - start.tv_sec < 30);
+	return catalog_wifi_ready() ? "Cannot reach YouTube Music" : "Wi-Fi did not connect";
+}
+
 static void show_response(void *arg) {
 	request_t *r = arg;
 	results_t *v = r->view;
@@ -239,7 +281,7 @@ static void show_response(void *arg) {
 	lv_obj_clean(v->list);
 	v->count = 0;
 	if (r->error) {
-		lv_label_set_text(lv_label_create(v->list), r->error);
+		list_message(v->list, r->error);
 		goto done;
 	}
 	if (r->offset) settingsrow_add(v->list, "Previous page", NULL, page_cb, (void *)(intptr_t)-40);
@@ -266,7 +308,7 @@ static void show_response(void *arg) {
 		}
 	}
 	if (!lv_obj_get_child_count(v->list))
-		lv_label_set_text(lv_label_create(v->list), "No results");
+		list_message(v->list, "No results");
 done:
 	free(r->body);
 	free(r);
@@ -280,11 +322,7 @@ static void *fetch_page(void *arg) {
 	} else {
 		http_url_encode(r->query, query, sizeof(query));
 		snprintf(url, sizeof(url), "%s/catalog/%s?q=%s&offset=%d", r->base, r->kind, query, r->offset);
-		int status = 0;
-		size_t length = 0;
-		if (!http_get_ex(url, header, false, &r->body, &length, 65536, 35, &status) || status != 200)
-			r->error = status == 409 ? "Link Google on Rabisu to open your library" :
-					   status == 401 ? "Check the device key on the SD card" : "YouTube Music unavailable";
+		r->error = load_catalog(url, header, &r->body);
 	}
 	if (!gui_post(show_response, r)) {
 		free(r->body);
@@ -304,7 +342,7 @@ static void request_page(results_t *v, const char *kind, const char *query, int 
 	strcpy(v->kind, r->kind);
 	strcpy(v->query, r->query);
 	lv_obj_clean(v->list);
-	lv_label_set_text(lv_label_create(v->list), "Loading…");
+	list_message(v->list, catalog_wifi_ready() ? "Loading…" : "Waiting for Wi-Fi…");
 	if (lv_screen_active() != v->screen) switch_screen(v->screen);
 	pthread_t worker;
 	if (!pthread_create(&worker, NULL, fetch_page, r)) pthread_detach(worker);
