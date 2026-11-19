@@ -1,6 +1,10 @@
 #include "youtubepage.h"
 
-#include <ctype.h>
+#include <dirent.h>
+#include <errno.h>
+#include <utime.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -12,10 +16,12 @@
 #include "src/gui/shell/settingsrow.h"
 #include "src/gui/shell/switcher.h"
 #include "src/gui/shell/theme.h"
+#include "src/gui/shell/toast.h"
 #include "src/gui/nowplaying/player.h"
 #include "src/system/device/system.h"
 #include "src/system/net/http.h"
-#include "src/system/streaming/radio.h"
+#include "src/system/playback/device_state.h"
+#include "src/system/playback/playlist.h"
 
 lv_obj_t *youtube_screen;
 static lv_obj_t *search_screen, *field;
@@ -26,7 +32,7 @@ typedef struct {
 	unsigned generation;
 	char kind[16], query[301];
 	int offset;
-	radio_station_t stations[40];
+	char ids[40][12];
 	int count;
 } results_t;
 static results_t catalog, tracks;
@@ -42,16 +48,173 @@ typedef struct {
 
 static void request_page(results_t *view, const char *kind, const char *query, int offset);
 
-static void play_cb(lv_event_t *e) {
-	radio_station_t *station = lv_event_get_user_data(e);
-	results_t *view = lv_screen_active() == tracks.screen ? &tracks : &catalog;
-	radio_set_list(view->stations, view->count);
-	if (radio_play(station)) {
-		player_refresh_now_playing();
-		player_sheet_open(true);
-	} else {
-		gui_notify_popup("Cannot play this track");
+static bool config(char *base, size_t size, char *header, size_t header_size) {
+	char file[512], token[100];
+	const char *root = storage_sd_root();
+	if (!root) return false;
+	snprintf(file, sizeof(file), "%s/youtube-music.conf", root);
+	FILE *f = fopen(file, "r");
+	if (!f) return false;
+	bool ok = fgets(base, size, f) && fgets(token, sizeof(token), f);
+	fclose(f);
+	if (!ok) return false;
+	base[strcspn(base, "\r\n")] = 0;
+	token[strcspn(token, "\r\n")] = 0;
+	if (strncmp(base, "https://", 8) || strlen(token) != 64 || strspn(token, "0123456789abcdef") != 64)
+		return false;
+	snprintf(header, header_size, "Authorization: Bearer %s\r\n", token);
+	return true;
+}
+
+static bool valid_id(const char *id) {
+	return strlen(id) == 11 && strspn(id, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_") == 11;
+}
+
+typedef struct {
+	char path[512], id[12];
+	bool ok;
+} download_t;
+
+static pthread_mutex_t download_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static bool selected(const char *path) {
+	char current[512];
+	return playlist_current_path(current, sizeof(current)) && !strcmp(current, path);
+}
+
+// Only evict complete files from the private music cache. The worker holds
+// download_lock, so a partially received file never enters this accounting.
+static bool cache_room(const char *path, long incoming) {
+	const char *slash = strrchr(path, '/');
+	char dir[512];
+	if (!slash || (size_t)(slash-path) >= sizeof(dir)) return false;
+	snprintf(dir, sizeof(dir), "%.*s", (int)(slash-path), path);
+	for (;;) {
+		DIR *d = opendir(dir);
+		if (!d) return false;
+		long long used = 0;
+		time_t oldest = 0;
+		char victim[512] = "";
+		struct dirent *entry;
+		while ((entry = readdir(d))) {
+			const char *name = entry->d_name;
+			if (strlen(name) != 16 || strcmp(name+11, ".opus")) continue;
+			char file[512];
+			if (snprintf(file, sizeof(file), "%s/%s", dir, name) >= (int)sizeof(file)) continue;
+			struct stat st;
+			if (stat(file, &st) || !S_ISREG(st.st_mode)) continue;
+			used += st.st_size;
+			if (!victim[0] || st.st_mtime < oldest) {
+				oldest = st.st_mtime;
+				strcpy(victim, file);
+			}
+		}
+		closedir(d);
+		if (used + incoming <= 512LL * 1024 * 1024) return true;
+		if (!victim[0] || unlink(victim)) return false;
 	}
+}
+
+static bool fetch_opus(download_t *job) {
+	char base[240], header[128], url[512], part[530];
+	if (!config(base, sizeof(base), header, sizeof(header))) return false;
+	snprintf(url, sizeof(url), "%s/track-ticket/%s", base, job->id);
+	char *ticket = NULL;
+	size_t bytes = 0;
+	int status = 0;
+	bool ok = http_get_ex(url, header, false, &ticket, &bytes, 200, 20, &status);
+	if (!ok || status != 200 || !ticket || strncmp(ticket, "track/", 6)) {
+		free(ticket);
+		return false;
+	}
+	snprintf(url, sizeof(url), "%s/%s", base, ticket);
+	free(ticket);
+	http_stream_t stream;
+	if (!http_stream_open(&stream, url, 110)) return false;
+	snprintf(part, sizeof(part), "%s.part", job->path);
+	FILE *out = fopen(part, "wb");
+	long received = 0;
+	const long max_size = 256L * 1024 * 1024;
+	ok = out && stream.content_length > 0 && stream.content_length <= max_size && cache_room(job->path, stream.content_length);
+	while (ok && received < stream.content_length) {
+		char buffer[16384];
+		int n = http_stream_read(&stream, buffer, sizeof(buffer));
+		ok = n > 0 && (received || (n >= 4 && !memcmp(buffer, "OggS", 4))) &&
+			 fwrite(buffer, 1, n, out) == (size_t)n;
+		if (ok) received += n;
+	}
+	if (out && fclose(out)) ok = false;
+	ok = ok && received == stream.content_length;
+	http_stream_close(&stream);
+	if (ok && rename(part, job->path) == 0) return true;
+	unlink(part);
+	return false;
+}
+
+static void downloaded(void *arg) {
+	download_t *job = arg;
+	if (selected(job->path)) {
+		if (job->ok) {
+			device_state_play_queue_index(playlist_current_index());
+			player_refresh_now_playing();
+		} else gui_notify_popup("Cannot load YouTube Music track");
+	}
+	free(job);
+}
+
+static void *download_worker(void *arg) {
+	download_t *job = arg;
+	pthread_mutex_lock(&download_lock);
+	job->ok = !access(job->path, R_OK) || fetch_opus(job);
+	pthread_mutex_unlock(&download_lock);
+	if (!gui_post(downloaded, job)) free(job);
+	return NULL;
+}
+
+static bool prepare_opus(const char *path) {
+	const char *root = storage_sd_root();
+	if (!root) return true;
+	char prefix[512];
+	snprintf(prefix, sizeof(prefix), "%s/.local/youtube/", root);
+	if (strncmp(path, prefix, strlen(prefix))) return true;
+	if (!access(path, R_OK)) {
+		utime(path, NULL);
+		return true;
+	}
+	const char *name = path + strlen(prefix);
+	if (strlen(name) != 16 || strcmp(name + 11, ".opus")) return false;
+	download_t *job = calloc(1, sizeof(*job));
+	if (!job) return false;
+	memcpy(job->id, name, 11);
+	snprintf(job->path, sizeof(job->path), "%s", path);
+	device_state_stop();
+	pthread_t worker;
+	if (valid_id(job->id) && !pthread_create(&worker, NULL, download_worker, job))
+		pthread_detach(worker);
+	else free(job);
+	return false;
+}
+
+static void play_cb(lv_event_t *e) {
+	results_t *view = lv_screen_active() == tracks.screen ? &tracks : &catalog;
+	int index = (int)(intptr_t)lv_event_get_user_data(e);
+	const char *root = storage_sd_root();
+	if (!root || index < 0 || index >= view->count) return;
+	char dir[512], paths[40][512];
+	const char *queue[40];
+	snprintf(dir, sizeof(dir), "%s/.local/youtube", root);
+	if (mkdir(dir, 0755) && errno != EEXIST) {
+		gui_notify_popup("Cannot create YouTube Music cache");
+		return;
+	}
+	for (int i = 0; i < view->count; i++) {
+		snprintf(paths[i], sizeof(paths[i]), "%s/.local/youtube/%s.opus", root, view->ids[i]);
+		queue[i] = paths[i];
+	}
+	if (access(paths[index], R_OK)) toast_plain("Loading YouTube Music track…");
+	device_state_play_list(queue, view->count, index);
+	player_refresh_now_playing();
+	player_sheet_open(true);
 }
 
 static void playlist_cb(lv_event_t *e) {
@@ -96,13 +259,10 @@ static void show_response(void *arg) {
 			lv_obj_t *row = settingsrow_add(v->list, title, NULL, playlist_cb, copy);
 			lv_obj_add_event_cb(row, free_id, LV_EVENT_DELETE, copy);
 		} else if (!strcmp(kind, "song") && !strncmp(path, "audio/", 6) && v->count < 40) {
-			radio_station_t *s = &v->stations[v->count++];
-			memset(s, 0, sizeof(*s));
-			snprintf(s->uuid, sizeof(s->uuid), "yt-%s", id);
-			snprintf(s->name, sizeof(s->name), "%s", title);
-			snprintf(s->url, sizeof(s->url), "%s/%s", r->base, path);
-			snprintf(s->codec, sizeof(s->codec), "MP3");
-			settingsrow_name_lines(settingsrow_add(v->list, title, NULL, play_cb, s), 2);
+			if (!valid_id(id)) continue;
+			int index = v->count++;
+			strcpy(v->ids[index], id);
+			settingsrow_name_lines(settingsrow_add(v->list, title, NULL, play_cb, (void *)(intptr_t)index), 2);
 		}
 	}
 	if (!lv_obj_get_child_count(v->list))
@@ -114,24 +274,12 @@ done:
 
 static void *fetch_page(void *arg) {
 	request_t *r = arg;
-	char file[512], token[100], header[128], query[910], url[1450];
-	const char *root = storage_sd_root();
-	snprintf(file, sizeof(file), "%s/youtube-music.conf", root ? root : "");
-	FILE *f = root ? fopen(file, "r") : NULL;
-	bool ok = f && fgets(r->base, sizeof(r->base), f) && fgets(token, sizeof(token), f);
-	if (f) fclose(f);
-	if (ok) {
-		r->base[strcspn(r->base, "\r\n")] = 0;
-		token[strcspn(token, "\r\n")] = 0;
-		ok = !strncmp(r->base, "https://", 8) && strlen(token) == 64 &&
-			 strspn(token, "0123456789abcdef") == 64;
-	}
-	if (!ok) {
+	char header[128], query[910], url[1450];
+	if (!config(r->base, sizeof(r->base), header, sizeof(header))) {
 		r->error = "Copy youtube-music.conf to the SD card";
 	} else {
 		http_url_encode(r->query, query, sizeof(query));
 		snprintf(url, sizeof(url), "%s/catalog/%s?q=%s&offset=%d", r->base, r->kind, query, r->offset);
-		snprintf(header, sizeof(header), "Authorization: Bearer %s\r\n", token);
 		int status = 0;
 		size_t length = 0;
 		if (!http_get_ex(url, header, false, &r->body, &length, 65536, 35, &status) || status != 200)
@@ -177,6 +325,7 @@ static void search_cb(lv_event_t *e) {
 }
 
 void youtubepage_init(gui_config_t *cfg) {
+	device_state_add_prepare_cb(prepare_opus);
 	youtube_screen = lv_obj_create(NULL);
 	search_screen = lv_obj_create(NULL);
 	catalog.screen = lv_obj_create(NULL);

@@ -1695,6 +1695,9 @@ static void lyrics_request(const device_state_t *state) {
 	if (strcmp(state->current_file, lyrics_path) == 0) {
 		return;
 	}
+	// A streaming queue can select the final path before the download is
+	// committed. Retry after it arrives instead of caching an empty result.
+	if (access(state->current_file, R_OK) != 0) return;
 	snprintf(lyrics_path, sizeof(lyrics_path), "%s", state->current_file);
 	lyrics_free(&lyrics_cur);
 	lyrics_loaded = false;

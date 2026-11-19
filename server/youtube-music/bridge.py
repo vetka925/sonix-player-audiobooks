@@ -1,4 +1,5 @@
 """Personal Sonix bridge. Catalog requires device auth, streams use short-lived tickets."""
+import base64
 import hashlib
 import hmac
 import json
@@ -7,11 +8,14 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
 import requests
-from flask import Flask, Response, abort, request
+from flask import Flask, Response, abort, request, send_file
+from mutagen.flac import Picture
+from mutagen.oggopus import OggOpus
 from ytmusicapi import OAuthCredentials, YTMusic
 
 app = Flask(__name__)
@@ -56,7 +60,7 @@ def official_playlists(kind, query, limit, client, token_file):
         token.update(update)
         token["expires_at"] = time.time() + update["expires_in"]
         temporary = token_file.with_suffix(".refresh")
-        with temporary.open("w", opener=lambda path, flags: os.open(path, flags, 0o600)) as out:
+        with open(temporary, "w", opener=lambda path, flags: os.open(path, flags, 0o600)) as out:
             json.dump(token, out)
         temporary.replace(token_file)
 
@@ -182,3 +186,84 @@ def audio(track, expires, ticket):
     response = Response(chunks(), mimetype="audio/mpeg")
     response.call_on_close(finish)
     return response
+
+
+@app.get("/track-ticket/<track>")
+def track_ticket(track):
+    if not hmac.compare_digest(request.headers.get("Authorization", ""), "Bearer " + key):
+        abort(401)
+    if not video_id.fullmatch(track):
+        abort(400)
+    expires = int(time.time()) + 900
+    return Response(f"track/{track}/{expires}/{signature(track, expires)}", mimetype="text/plain")
+
+
+def tag_opus(path, track, info):
+    audio = OggOpus(path)
+    api = YTMusic()
+    watch = {}
+    song = {}
+    try:
+        watch = api.get_watch_playlist(videoId=track, limit=1)
+        song = next((t for t in watch["tracks"] if t.get("videoId") == track), {})
+    except Exception:
+        app.logger.warning("YouTube Music metadata unavailable")
+    fields = {"title": song.get("title") or info.get("track") or info.get("title"),
+              "artist": ", ".join(a["name"] for a in song.get("artists", []) if a.get("name")) or info.get("artist") or info.get("uploader"),
+              "album": (song.get("album") or {}).get("name") or info.get("album")}
+    for field, value in fields.items():
+        if value:
+            audio[field] = value
+    if watch.get("lyrics"):
+        try:
+            lyrics = api.get_lyrics(watch["lyrics"])
+            if lyrics and lyrics.get("lyrics"):
+                audio["lyrics"] = lyrics["lyrics"]
+        except Exception:
+            app.logger.warning("Lyrics unavailable")
+    images = song.get("thumbnail") or info.get("thumbnails") or []
+    if isinstance(images, dict):
+        images = images.get("thumbnails", [])
+    if images:
+        try:
+            url = images[-1]["url"]
+            image = requests.get(url, timeout=12)
+            image.raise_for_status()
+            jpeg = subprocess.run(["ffmpeg", "-loglevel", "error", "-i", "pipe:0", "-vf",
+                                   "scale=480:480:force_original_aspect_ratio=decrease", "-frames:v", "1",
+                                   "-f", "mjpeg", "pipe:1"], input=image.content, capture_output=True,
+                                  timeout=12, check=True).stdout
+            picture = Picture()
+            picture.type, picture.mime, picture.data = 3, "image/jpeg", jpeg
+            audio["metadata_block_picture"] = base64.b64encode(picture.write()).decode("ascii")
+        except (requests.RequestException, subprocess.SubprocessError, KeyError):
+            app.logger.warning("Cover unavailable")
+    audio.save()
+
+
+@app.get("/track/<track>/<int:expires>/<ticket>")
+def track_file(track, expires, ticket):
+    if not video_id.fullmatch(track) or expires < time.time() or not hmac.compare_digest(signature(track, expires), ticket):
+        abort(403)
+    if not audio_slots.acquire(blocking=False):
+        abort(503)
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source"
+            output = Path(directory) / "track.opus"
+            subprocess.run([sys.executable, "-m", "yt_dlp", "--no-playlist", "--quiet", "--write-info-json",
+                            "--socket-timeout", "15", "--retries", "1", "--max-filesize", "240M",
+                            "-f", "bestaudio[acodec=opus]", "-o", str(source),
+                            "https://music.youtube.com/watch?v=" + track], capture_output=True, timeout=120, check=True)
+            info = json.loads(source.with_suffix(".info.json").read_text())
+            subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-i", str(source),
+                            "-map", "0:a:0", "-c:a", "copy", str(output)], capture_output=True, timeout=40, check=True)
+            tag_opus(output, track, info)
+            size = output.stat().st_size
+            response = send_file(output.open("rb"), mimetype="audio/ogg", conditional=False)
+            response.content_length = size
+            return response
+    except (OSError, subprocess.SubprocessError):
+        abort(502, "Original Opus unavailable")
+    finally:
+        audio_slots.release()
