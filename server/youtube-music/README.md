@@ -1,7 +1,8 @@
 # Personal YouTube Music playback
 
-The catalog uses the YouTube Data API with its read-only grant. For account
-audio, mount the TV client's client.json and a separately authorized
+Personal playlists use the YouTube Data API with its read-only grant. Liked
+songs (the LM music playlist) and library songs (the Songs tab of the music
+library) use the TV browse client with the same grant as account audio. Mount the TV client's client.json and a separately authorized
 playback/oauth.json under the private state directory. The latter uses the
 YouTube OAuth scope. Keep both grants outside the image and source tree.
 

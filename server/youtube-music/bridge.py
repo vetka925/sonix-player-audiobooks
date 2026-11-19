@@ -16,7 +16,10 @@ import requests
 from flask import Flask, Response, abort, request, send_file
 from mutagen.flac import Picture
 from mutagen.oggopus import OggOpus
-from ytmusicapi import OAuthCredentials, YTMusic
+from ytmusicapi import YTMusic
+from yt_dlp.extractor.youtube._base import INNERTUBE_CLIENTS
+
+from account_audio import access_token
 
 app = Flask(__name__)
 state = Path(os.environ["SONIX_YTM_STATE"])
@@ -101,20 +104,73 @@ def official_playlists(kind, query, limit, client, token_file):
     return rows
 
 
+def music_collection(kind, limit):
+    if not (state / "playback/oauth.json").is_file():
+        abort(409, "Link the Google TV account on Rabisu")
+    headers = {"Authorization": "Bearer " + access_token(state)}
+    context = INNERTUBE_CLIENTS["tv"]["INNERTUBE_CONTEXT"]
+
+    def browse(**params):
+        response = requests.post("https://music.youtube.com/youtubei/v1/browse",
+                                 json={"context": context, **params}, headers=headers,
+                                 timeout=15, allow_redirects=False)
+        response.raise_for_status()
+        return response.json()
+
+    rows = []
+    try:
+        if kind == "likes":
+            content = browse(browseId="VLLM")["contents"]["tvBrowseRenderer"]["content"]
+            page = content["tvSurfaceContentRenderer"]["content"]["twoColumnRenderer"][
+                "rightColumn"]["playlistVideoListRenderer"]
+        else:
+            content = browse(browseId="FEmusic_library_landing")["contents"]["tvBrowseRenderer"]["content"]
+            sections = content["tvSecondaryNavRenderer"]["sections"]
+            tabs = (item["tabRenderer"] for section in sections
+                    for item in section["tvSecondaryNavSectionRenderer"]["tabs"])
+            tab = next(t for t in tabs if t["endpoint"]["browseEndpoint"]["browseId"] == "FEmusic_liked_videos")
+            surface = tab["content"]["tvSurfaceContentRenderer"]
+            token = surface["continuation"]["reloadContinuationData"]["continuation"]
+            surface = browse(continuation=token)["continuationContents"]["tvSurfaceContentContinuation"]
+            page = surface["content"]["gridRenderer"]
+
+        seen = set()
+        while True:
+            items = page["contents"] if kind == "likes" else page["items"]
+            for item in items:
+                tile = item.get("tileRenderer", {})
+                if tile.get("contentType") != "TILE_CONTENT_TYPE_VIDEO":
+                    continue
+                meta = tile["metadata"]["tileMetadataRenderer"]
+                title = "".join(run["text"] for run in meta["title"]["runs"])
+                lines = meta.get("lines", [])
+                artist = (lines[0]["lineRenderer"]["items"][0]["lineItemRenderer"]
+                          .get("text", {}).get("simpleText", "")) if lines else ""
+                rows.extend(songs([{"videoId": tile["contentId"], "title": title,
+                                    "artists": [{"name": artist}]}]))
+                if len(rows) >= limit:
+                    return rows
+            token = next((d["nextContinuationData"]["continuation"]
+                          for d in page.get("continuations", []) if "nextContinuationData" in d), None)
+            if not token or token in seen:
+                return rows
+            seen.add(token)
+            continuation = browse(continuation=token)["continuationContents"]
+            page = continuation["playlistVideoListContinuation" if kind == "likes" else "gridContinuation"]
+    except (requests.RequestException, KeyError, IndexError, StopIteration, ValueError):
+        abort(502, "YouTube Music collection unavailable")
+
+
 def private_catalog(kind, query, limit):
     client_file = state / "client.json"
     token_file = state / "oauth.json"
     if not client_file.exists() or not token_file.exists():
         abort(409, "Link Google on Rabisu")
+    if kind in ("songs", "likes"):
+        return music_collection(kind, limit)
     with library_lock:
         client = json.loads(client_file.read_text())
-        if kind in ("playlist", "playlists"):
-            return official_playlists(kind, query, limit, client, token_file)
-        api = YTMusic(str(token_file), oauth_credentials=OAuthCredentials(**client))
-        if kind == "songs":
-            return songs(api.get_library_songs(limit))
-        if kind == "likes":
-            return songs(api.get_liked_songs(limit)["tracks"])
+        return official_playlists(kind, query, limit, client, token_file)
 
 
 @app.after_request
