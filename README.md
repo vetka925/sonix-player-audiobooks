@@ -1,5 +1,7 @@
 # Sonix Player · Audiobooks
 
+**Experimental HiBy R1 build with YouTube Music.** This branch adds streaming and offline playback through a personal HTTPS bridge. Start with the [setup and verification guide](server/youtube-music/README.md) and the [experimental R1 firmware](https://github.com/vetka925/sonix-player-audiobooks/releases/tag/r1-youtube-music-v0.1.0-exp.1).
+
 **A small music player. A better place for your books.**
 
 An audiobook-focused fork of [Sonix Player](https://github.com/Jepl4r/sonix-player)

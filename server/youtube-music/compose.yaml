@@ -1,0 +1,27 @@
+services:
+  sonix-youtube:
+    build: .
+    user: "${SONIX_UID:?Set SONIX_UID}:${SONIX_GID:?Set SONIX_GID}"
+    environment:
+      HOME: /tmp
+    volumes:
+      - "${SONIX_STATE_DIR:?Set SONIX_STATE_DIR}:/state"
+    restart: unless-stopped
+  proxy:
+    image: caddy:2
+    depends_on:
+      - sonix-youtube
+    environment:
+      MUSIC_HOST: "${MUSIC_HOST:?Set MUSIC_HOST}"
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./Caddyfile.fragment:/etc/caddy/sonix-music.caddy:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    restart: unless-stopped
+volumes:
+  caddy_data:
+  caddy_config:

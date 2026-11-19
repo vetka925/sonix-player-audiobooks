@@ -1,0 +1,3 @@
+{$MUSIC_HOST} {
+    import /etc/caddy/sonix-music.caddy
+}
